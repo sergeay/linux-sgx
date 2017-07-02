@@ -259,7 +259,6 @@ struct sgx_launch_request {
 	u8 mrsigner[32];
 	uint64_t attributes;
 	uint64_t xfrm;
-	struct sgx_einittoken token;
 };
 
 #define SGX_FN(name, params...)		\

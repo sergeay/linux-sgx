@@ -774,20 +774,6 @@ int sgx_encl_add_page(struct sgx_encl *encl, unsigned long addr, void *data,
 	return ret;
 }
 
-static int sgx_einit(struct sgx_encl *encl, struct sgx_sigstruct *sigstruct,
-		     struct sgx_einittoken *token)
-{
-	struct sgx_epc_page *secs_epc = encl->secs.epc_page;
-	void *secs_va;
-	int ret;
-
-	secs_va = sgx_get_page(secs_epc);
-	ret = __einit(sigstruct, token, secs_va);
-	sgx_put_page(secs_va);
-
-	return ret;
-}
-
 /**
  * sgx_encl_init - perform EINIT for the given enclave
  *
@@ -821,8 +807,8 @@ int sgx_encl_init(struct sgx_encl *encl, struct sgx_sigstruct *sigstruct,
 
 	for (i = 0; i < SGX_EINIT_SLEEP_COUNT; i++) {
 		for (j = 0; j < SGX_EINIT_SPIN_COUNT; j++) {
-			ret = sgx_einit(encl, sigstruct, token);
-
+			ret = sgx_einit(sigstruct, token, encl->secs.epc_page,
+					sgx_le_pubkeyhash);
 			if (ret == SGX_UNMASKED_EVENT)
 				continue;
 			else
