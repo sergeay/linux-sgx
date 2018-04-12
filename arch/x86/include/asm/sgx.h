@@ -14,6 +14,7 @@
 #include <asm/asm.h>
 #include <linux/bitops.h>
 #include <linux/err.h>
+#include <linux/rwsem.h>
 #include <linux/types.h>
 
 #define SGX_CPUID 0x12
@@ -193,7 +194,73 @@ static inline int __emodt(struct sgx_secinfo *secinfo, void *epc)
 	return __encls_ret_2(EMODT, secinfo, epc);
 }
 
+#define SGX_MAX_EPC_BANKS 8
+
+#define SGX_EPC_BANK(epc_page) \
+	(&sgx_epc_banks[(unsigned long)(epc_page->desc) & ~PAGE_MASK])
+#define SGX_EPC_PFN(epc_page) PFN_DOWN((unsigned long)(epc_page->desc))
+#define SGX_EPC_ADDR(epc_page) ((unsigned long)(epc_page->desc) & PAGE_MASK)
+
+struct sgx_epc_page;
+
+struct sgx_epc_page_ops {
+	bool (*get)(struct sgx_epc_page *epc_page);
+	void (*put)(struct sgx_epc_page *epc_page);
+	bool (*reclaim)(struct sgx_epc_page *epc_page);
+	void (*block)(struct sgx_epc_page *epc_page);
+	void (*write)(struct sgx_epc_page *epc_page);
+};
+
+struct sgx_epc_page_impl {
+	const struct sgx_epc_page_ops *ops;
+};
+
+struct sgx_epc_page {
+	unsigned long desc;
+	struct sgx_epc_page_impl *impl;
+	struct list_head list;
+};
+
+struct sgx_epc_bank {
+	unsigned long pa;
+	unsigned long va;
+	unsigned long size;
+	struct sgx_epc_page *pages_data;
+	struct sgx_epc_page **pages;
+	atomic_t free_cnt;
+	struct rw_semaphore lock;
+};
+
 extern bool sgx_enabled;
+extern bool sgx_lc_enabled;
+extern atomic_t sgx_nr_free_pages;
+extern struct sgx_epc_bank sgx_epc_banks[];
+extern int sgx_nr_epc_banks;
+extern struct list_head sgx_active_page_list;
+extern struct spinlock sgx_active_page_list_lock;
+
+enum sgx_alloc_flags {
+	SGX_ALLOC_ATOMIC	= BIT(0),
+};
+
+struct sgx_epc_page *sgx_try_alloc_page(struct sgx_epc_page_impl *impl);
+struct sgx_epc_page *sgx_alloc_page(struct sgx_epc_page_impl *impl,
+				    unsigned int flags);
+int sgx_free_page(struct sgx_epc_page *page);
+void *sgx_get_page(struct sgx_epc_page *ptr);
+void sgx_put_page(void *epc_page_ptr);
+struct page *sgx_get_backing(struct file *file, pgoff_t index);
+void sgx_put_backing(struct page *backing_page, bool write);
+int sgx_einit(struct sgx_sigstruct *sigstruct, struct sgx_einittoken *token,
+	      struct sgx_epc_page *secs_page, u64 le_pubkey_hash[4]);
+
+struct sgx_launch_request {
+	u8 mrenclave[32];
+	u8 mrsigner[32];
+	uint64_t attributes;
+	uint64_t xfrm;
+	struct sgx_einittoken token;
+};
 
 #define SGX_FN(name, params...)		\
 {					\
