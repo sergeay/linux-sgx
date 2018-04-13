@@ -45,6 +45,8 @@
 #define MOVADQ	movaps
 #define MOVUDQ	movups
 
+#ifndef AESNI_INTEL_MINIMAL
+
 #ifdef __x86_64__
 
 # constants in mergeable sections, linker can reorder and merge
@@ -132,6 +134,8 @@ ALL_F:      .octa 0xffffffffffffffffffffffffffffffff
 #define arg11 STACK_OFFSET+40(%rsp)
 #define keysize 2*15*16(%arg1)
 #endif
+
+#endif /* AESNI_INTEL_MINIMAL */
 
 
 #define STATE1	%xmm0
@@ -505,6 +509,8 @@ _T_16_\@:
 	movdqu	%xmm0, (%r10)
 _return_T_done_\@:
 .endm
+
+#ifndef AESNI_INTEL_MINIMAL
 
 #ifdef __x86_64__
 /* GHASH_MUL MACRO to implement: Data*HashKey mod (128,127,126,121,0)
@@ -1760,6 +1766,7 @@ ENDPROC(aesni_gcm_finalize)
 
 #endif
 
+#endif /* AESNI_INTEL_MINIMAL */
 
 .align 4
 _key_expansion_128:
@@ -2030,6 +2037,8 @@ _aesni_enc1:
 	AESENCLAST KEY STATE
 	ret
 ENDPROC(_aesni_enc1)
+
+#ifndef AESNI_INTEL_MINIMAL
 
 /*
  * _aesni_enc4:	internal ABI
@@ -2840,3 +2849,5 @@ ENTRY(aesni_xts_crypt8)
 ENDPROC(aesni_xts_crypt8)
 
 #endif
+
+#endif /* AESNI_INTEL_MINIMAL */
