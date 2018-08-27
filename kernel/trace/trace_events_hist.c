@@ -1,15 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * trace_events_hist - trace event hist triggers
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  *
  * Copyright (C) 2015 Tom Zanussi <tom.zanussi@linux.intel.com>
  */
@@ -393,7 +384,7 @@ static void hist_err_event(char *str, char *system, char *event, char *var)
 	else if (system)
 		snprintf(err, MAX_FILTER_STR_VAL, "%s.%s", system, event);
 	else
-		strncpy(err, var, MAX_FILTER_STR_VAL);
+		strscpy(err, var, MAX_FILTER_STR_VAL);
 
 	hist_err(str, err);
 }
@@ -2865,7 +2856,7 @@ static struct trace_event_file *event_file(struct trace_array *tr,
 {
 	struct trace_event_file *file;
 
-	file = find_event_file(tr, system, event_name);
+	file = __find_event_file(tr, system, event_name);
 	if (!file)
 		return ERR_PTR(-EINVAL);
 
@@ -5141,7 +5132,7 @@ static void hist_clear(struct event_trigger_data *data)
 	if (data->name)
 		pause_named_trigger(data);
 
-	synchronize_sched();
+	tracepoint_synchronize_unregister();
 
 	tracing_map_clear(hist_data->map);
 

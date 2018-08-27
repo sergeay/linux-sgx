@@ -16,6 +16,7 @@
 #include <linux/prefetch.h>		/* prefetchw			*/
 #include <linux/context_tracking.h>	/* exception_enter(), ...	*/
 #include <linux/uaccess.h>		/* faulthandler_disabled()	*/
+#include <linux/mm_types.h>
 
 #include <asm/cpufeature.h>		/* boot_cpu_has, ...		*/
 #include <asm/traps.h>			/* dotraplinkage, ...		*/
@@ -209,6 +210,7 @@ force_sig_info_fault(int si_signo, int si_code, unsigned long address,
 	unsigned lsb = 0;
 	siginfo_t info;
 
+	clear_siginfo(&info);
 	info.si_signo	= si_signo;
 	info.si_errno	= 0;
 	info.si_code	= si_code;
@@ -315,8 +317,6 @@ static noinline int vmalloc_fault(unsigned long address)
 	/* Make sure we are in vmalloc area: */
 	if (!(address >= VMALLOC_START && address < VMALLOC_END))
 		return -1;
-
-	WARN_ON_ONCE(in_nmi());
 
 	/*
 	 * Synchronize this task's top level page-table
@@ -439,7 +439,7 @@ static noinline int vmalloc_fault(unsigned long address)
 	if (pgd_none(*pgd_k))
 		return -1;
 
-	if (pgtable_l5_enabled) {
+	if (pgtable_l5_enabled()) {
 		if (pgd_none(*pgd)) {
 			set_pgd(pgd, *pgd_k);
 			arch_flush_lazy_mmu_mode();
@@ -454,7 +454,7 @@ static noinline int vmalloc_fault(unsigned long address)
 	if (p4d_none(*p4d_k))
 		return -1;
 
-	if (p4d_none(*p4d) && !pgtable_l5_enabled) {
+	if (p4d_none(*p4d) && !pgtable_l5_enabled()) {
 		set_p4d(p4d, *p4d_k);
 		arch_flush_lazy_mmu_mode();
 	} else {
@@ -640,11 +640,6 @@ static int is_f00f_bug(struct pt_regs *regs, unsigned long address)
 	return 0;
 }
 
-static const char nx_warning[] = KERN_CRIT
-"kernel tried to execute NX-protected page - exploit attempt? (uid: %d)\n";
-static const char smep_warning[] = KERN_CRIT
-"unable to execute userspace code (SMEP?) (uid: %d)\n";
-
 static void
 show_fault_oops(struct pt_regs *regs, unsigned long error_code,
 		unsigned long address)
@@ -663,20 +658,18 @@ show_fault_oops(struct pt_regs *regs, unsigned long error_code,
 		pte = lookup_address_in_pgd(pgd, address, &level);
 
 		if (pte && pte_present(*pte) && !pte_exec(*pte))
-			printk(nx_warning, from_kuid(&init_user_ns, current_uid()));
+			pr_crit("kernel tried to execute NX-protected page - exploit attempt? (uid: %d)\n",
+				from_kuid(&init_user_ns, current_uid()));
 		if (pte && pte_present(*pte) && pte_exec(*pte) &&
 				(pgd_flags(*pgd) & _PAGE_USER) &&
 				(__read_cr4() & X86_CR4_SMEP))
-			printk(smep_warning, from_kuid(&init_user_ns, current_uid()));
+			pr_crit("unable to execute userspace code (SMEP?) (uid: %d)\n",
+				from_kuid(&init_user_ns, current_uid()));
 	}
 
-	printk(KERN_ALERT "BUG: unable to handle kernel ");
-	if (address < PAGE_SIZE)
-		printk(KERN_CONT "NULL pointer dereference");
-	else
-		printk(KERN_CONT "paging request");
-
-	printk(KERN_CONT " at %px\n", (void *) address);
+	pr_alert("BUG: unable to handle kernel %s at %px\n",
+		 address < PAGE_SIZE ? "NULL pointer dereference" : "paging request",
+		 (void *)address);
 
 	dump_pagetable(address);
 }
@@ -713,10 +706,19 @@ no_context(struct pt_regs *regs, unsigned long error_code,
 {
 	struct task_struct *tsk = current;
 	unsigned long flags;
-	int sig;
+	int sig, trapnr;
+
+	/*
+	 * The actual vector is #PF.  Propagate the PF_SGX bit from the error
+	 * code to the trapnr so that SGX code can filter out "benign" faults.
+	 * PF_SGX (bit 15) doesn't collide with fault vectors (bits 4:0) and
+	 * can only be set on SGX EPC accesses, i.e. only code emitting ENCLS
+	 * instructions needs to be prepared to handle PF_SGX in trapnr.
+	 */
+	trapnr = X86_TRAP_PF | (error_code & X86_PF_SGX);
 
 	/* Are we prepared to handle this kernel fault? */
-	if (fixup_exception(regs, X86_TRAP_PF)) {
+	if (fixup_exception(regs, trapnr)) {
 		/*
 		 * Any interrupt that takes a fault gets the fixup. This makes
 		 * the below recursive fault logic only apply to a faults from
@@ -828,6 +830,8 @@ static inline void
 show_signal_msg(struct pt_regs *regs, unsigned long error_code,
 		unsigned long address, struct task_struct *tsk)
 {
+	const char *loglvl = task_pid_nr(tsk) > 1 ? KERN_INFO : KERN_EMERG;
+
 	if (!unhandled_signal(tsk, SIGSEGV))
 		return;
 
@@ -835,13 +839,14 @@ show_signal_msg(struct pt_regs *regs, unsigned long error_code,
 		return;
 
 	printk("%s%s[%d]: segfault at %lx ip %px sp %px error %lx",
-		task_pid_nr(tsk) > 1 ? KERN_INFO : KERN_EMERG,
-		tsk->comm, task_pid_nr(tsk), address,
+		loglvl, tsk->comm, task_pid_nr(tsk), address,
 		(void *)regs->ip, (void *)regs->sp, error_code);
 
 	print_vma_addr(KERN_CONT " in ", regs->ip);
 
 	printk(KERN_CONT "\n");
+
+	show_opcodes((u8 *)regs->ip, loglvl);
 }
 
 static void
@@ -944,6 +949,11 @@ static inline bool bad_area_access_from_pkeys(unsigned long error_code,
 	/* This code is always called on the current mm */
 	bool foreign = false;
 
+	/*
+	 * This OSPKE check is not strictly necessary at runtime.
+	 * But, doing it this way allows compiler optimizations
+	 * if pkeys are compiled out.
+	 */
 	if (!boot_cpu_has(X86_FEATURE_OSPKE))
 		return false;
 	if (error_code & X86_PF_PK)
@@ -959,15 +969,13 @@ static noinline void
 bad_area_access_error(struct pt_regs *regs, unsigned long error_code,
 		      unsigned long address, struct vm_area_struct *vma)
 {
-	/*
-	 * This OSPKE check is not strictly necessary at runtime.
-	 * But, doing it this way allows compiler optimizations
-	 * if pkeys are compiled out.
-	 */
+	int si_code = SEGV_ACCERR;
+
 	if (bad_area_access_from_pkeys(error_code, vma))
-		__bad_area(regs, error_code, address, vma, SEGV_PKUERR);
-	else
-		__bad_area(regs, error_code, address, vma, SEGV_ACCERR);
+		si_code = SEGV_PKUERR;
+	else if (unlikely(error_code & X86_PF_SGX))
+		si_code = SEGV_SGXERR;
+	__bad_area(regs, error_code, address, vma, si_code);
 }
 
 static void
@@ -1004,7 +1012,7 @@ do_sigbus(struct pt_regs *regs, unsigned long error_code, unsigned long address,
 
 static noinline void
 mm_fault_error(struct pt_regs *regs, unsigned long error_code,
-	       unsigned long address, u32 *pkey, unsigned int fault)
+	       unsigned long address, u32 *pkey, vm_fault_t fault)
 {
 	if (fatal_signal_pending(current) && !(error_code & X86_PF_USER)) {
 		no_context(regs, error_code, address, 0, 0);
@@ -1158,6 +1166,17 @@ access_error(unsigned long error_code, struct vm_area_struct *vma)
 		return 1;
 
 	/*
+	 * Access is blocked by the Enclave Page Cache Map (EPCM),
+	 * i.e. the access is allowed by the PTE but not the EPCM.
+	 * This usually happens when the EPCM is yanked out from
+	 * under us, e.g. by hardware after a suspend/resume cycle.
+	 * In any case, there is nothing that can be done by the
+	 * kernel to resolve the fault (short of killing the task).
+	 */
+	if (unlikely(error_code & X86_PF_SGX))
+		return 1;
+
+	/*
 	 * Make sure to check the VMA so that we do not perform
 	 * faults just to hit a X86_PF_PK as soon as we fill in a
 	 * page.
@@ -1218,7 +1237,7 @@ __do_page_fault(struct pt_regs *regs, unsigned long error_code,
 	struct vm_area_struct *vma;
 	struct task_struct *tsk;
 	struct mm_struct *mm;
-	int fault, major = 0;
+	vm_fault_t fault, major = 0;
 	unsigned int flags = FAULT_FLAG_ALLOW_RETRY | FAULT_FLAG_KILLABLE;
 	u32 pkey;
 

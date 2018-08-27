@@ -9,17 +9,9 @@
 #define _ASM_X86_SGX_ARCH_H
 
 #include <linux/types.h>
+#include <uapi/asm/sgx_errno.h>
 
 #define SGX_CPUID 0x12
-
-/**
- * enum sgx_cpuid_leaves - leaves of the SGX cpuid
- */
-enum sgx_cpuid_leaves {
-	SGX_CPUID_CAPABILITIES	= 0,
-	SGX_CPUID_ATTRIBUTES	= 1,
-	SGX_CPUID_EPC_BANKS	= 2,
-};
 
 /**
  * enum sgx_encls_leaves - ENCLS leaf functions

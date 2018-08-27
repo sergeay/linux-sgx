@@ -18,12 +18,26 @@
 #include <asm/sgx_pr.h>
 #include <uapi/asm/sgx.h>
 
+#define sgx_pr_ratelimited(level, encl, fmt, ...)			\
+	pr_ ## level ## _ratelimited("[%d:0x%p] " fmt,			\
+				     pid_nr((encl)->tgid),		\
+				     (void *)(encl)->base, ##__VA_ARGS__)
+#define sgx_dbg(encl, fmt, ...) \
+	sgx_pr_ratelimited(debug, encl, fmt, ##__VA_ARGS__)
+#define sgx_info(encl, fmt, ...) \
+	sgx_pr_ratelimited(info, encl, fmt, ##__VA_ARGS__)
+#define sgx_warn(encl, fmt, ...) \
+	sgx_pr_ratelimited(warn, encl, fmt, ##__VA_ARGS__)
+#define sgx_err(encl, fmt, ...) \
+	sgx_pr_ratelimited(err, encl, fmt, ##__VA_ARGS__)
+#define sgx_crit(encl, fmt, ...) \
+	sgx_pr_ratelimited(crit, encl, fmt, ##__VA_ARGS__)
+
 #define SGX_EINIT_SPIN_COUNT	20
 #define SGX_EINIT_SLEEP_COUNT	50
 #define SGX_EINIT_SLEEP_TIME	20
 
 #define SGX_VA_SLOT_COUNT 512
-#define SGX_VA_OFFSET_MASK ((SGX_VA_SLOT_COUNT - 1) << 3)
 
 struct sgx_va_page {
 	struct sgx_epc_page *epc_page;
@@ -31,15 +45,56 @@ struct sgx_va_page {
 	struct list_head list;
 };
 
-enum sgx_encl_page_flags {
-	SGX_ENCL_PAGE_TCS	= BIT(0),
-	SGX_ENCL_PAGE_RESERVED	= BIT(1),
-	SGX_ENCL_PAGE_LOADED	= BIT(2),
+/**
+ * enum sgx_encl_page_desc - defines bits and masks for an enclave page's desc
+ *
+ * @SGX_ENCL_PAGE_TCS:
+ * @SGX_ENCL_PAGE_LOADED:
+ * @SGX_ENCL_PAGE_RESERVED:  Set when we need to temporarily prevent reclaim,
+ *			     e.g. the page is being directly accessed for debug
+ *			     purposes.
+ * @SGX_ENCL_PAGE_RECLAIMED: Set when a LOADED page is in the process of being
+ *			     reclaimed by the EPC manager.  Once RECLAIMED is
+ *			     set we no longer "own" the EPC page; we're still
+ *			     involved in evicting the page, but we cannot free
+ *			     the EPC page or rely on its contents in any way.
+ *
+ * @SGX_ENCL_PAGE_VA_OFFSET_MASK: Holds the offset into the VA page that was
+ *				  used to evict the page.
+ * @SGX_ENCL_PAGE_ADDR_MASK:	  Holds the userspace virtual address of the
+ *				  page.  Primarily used to manipulate PTEs and
+ *				  retrieve an enclave from a given page.
+ *
+ * enum sgx_encl_page_desc defines the layout of struct sgx_encl_page's @desc.
+ * The metadata for an enclave page is compressed into a single variable to
+ * reduce memory consumption as the size of enclaves are effectively unbounded,
+ * e.g. a userspace process can create a 512gb enclave regardless of the actual
+ * amount of EPC in the system.
+ *
+ * WARNING: Bits 11:3 are effectively a union, similar to how a union is used
+ * to store either a pointer to an EPC page or VA page depending on whether or
+ * not a struct sgx_encl_page is resident in the EPC.  When the page is evicted
+ * from the EPC, bits 11:3 are used to hold the VA offset.  Flags that may be
+ * set/cleared at any time must not reside in bits 11:3.
+ */
+enum sgx_encl_page_desc {
+	SGX_ENCL_PAGE_TCS		= BIT(0),
+	SGX_ENCL_PAGE_LOADED		= BIT(1),
+	/* Bit 2 is free, may be used at any time */
+
+	SGX_ENCL_PAGE_RESERVED		= BIT(3),
+	SGX_ENCL_PAGE_RECLAIMED		= BIT(4),
+	/* Bits 11:5 are free, may only be used when page is resident in EPC */
+
+	SGX_ENCL_PAGE_VA_OFFSET_MASK	= GENMASK_ULL(11, 3),
+
+	SGX_ENCL_PAGE_ADDR_MASK		= PAGE_MASK,
 };
 
-#define SGX_ENCL_PAGE_ADDR(encl_page) ((encl_page)->desc & PAGE_MASK)
+#define SGX_ENCL_PAGE_ADDR(encl_page) \
+	((encl_page)->desc & SGX_ENCL_PAGE_ADDR_MASK)
 #define SGX_ENCL_PAGE_VA_OFFSET(encl_page) \
-	((encl_page)->desc & SGX_VA_OFFSET_MASK)
+	((encl_page)->desc & SGX_ENCL_PAGE_VA_OFFSET_MASK)
 #define SGX_ENCL_PAGE_BACKING_INDEX(encl_page, encl)		\
 ({								\
 	pgoff_t index;						\
@@ -94,6 +149,7 @@ struct sgx_encl {
 	struct sgx_encl_page secs;
 	struct pid *tgid;
 	struct mmu_notifier mmu_notifier;
+	struct notifier_block pm_notifier;
 };
 
 extern struct workqueue_struct *sgx_add_page_wq;
@@ -108,12 +164,10 @@ extern const struct vm_operations_struct sgx_vm_ops;
 int sgx_encl_find(struct mm_struct *mm, unsigned long addr,
 		  struct vm_area_struct **vma);
 void sgx_invalidate(struct sgx_encl *encl, bool flush_cpus);
-#define SGX_INVD(ret, encl, fmt, ...)			\
-do {							\
-	if (unlikely(ret)) {				\
-		sgx_err(encl, fmt, ##__VA_ARGS__);	\
-		sgx_invalidate(encl, true);		\
-	}						\
+#define SGX_INVD(ret, encl, fmt, ...)		\
+do {						\
+	if (WARN(ret, "sgx: " fmt, ##__VA_ARGS__))	\
+		sgx_invalidate(encl, true);	\
 } while (0)
 
 struct sgx_encl *sgx_encl_alloc(struct sgx_secs *secs);

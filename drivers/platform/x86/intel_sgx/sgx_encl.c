@@ -10,6 +10,7 @@
 #include <linux/sched/signal.h>
 #include <linux/shmem_fs.h>
 #include <linux/slab.h>
+#include <linux/suspend.h>
 #include "sgx.h"
 
 struct sgx_add_page_req {
@@ -52,27 +53,15 @@ int sgx_encl_find(struct mm_struct *mm, unsigned long addr,
 	return encl ? 0 : -ENOENT;
 }
 
-static void sgx_encl_free_va_pages(struct sgx_encl *encl)
-{
-	struct sgx_va_page *va_page;
-
-	while (!list_empty(&encl->va_pages)) {
-		va_page = list_first_entry(&encl->va_pages, struct sgx_va_page,
-					   list);
-		list_del(&va_page->list);
-		sgx_free_page(va_page->epc_page);
-		kfree(va_page);
-	}
-}
-
 /**
- * sgx_invalidate - kill an active enclave
- *
+ * sgx_invalidate - kill an enclave
  * @encl:	an &sgx_encl instance
- * @flush_cpus	whether to kick threads out of the enclave
+ * @flush_cpus	Set if there can be active threads inside the enclave.
  *
- * Clear PTEs for all the entry points, kick threads out of the enclave if
- * requested and mark enclave state as dead.
+ * Mark the enclave as dead and immediately free its EPC pages (but not
+ * its resources).  For active enclaves, the entry points to the enclave
+ * are destroyed first and hardware threads are kicked out so that the
+ * EPC pages can be safely manipulated.
  */
 void sgx_invalidate(struct sgx_encl *encl, bool flush_cpus)
 {
@@ -85,22 +74,30 @@ void sgx_invalidate(struct sgx_encl *encl, bool flush_cpus)
 	if (encl->flags & SGX_ENCL_DEAD)
 		return;
 
+	encl->flags |= SGX_ENCL_DEAD;
+	if (flush_cpus) {
+		radix_tree_for_each_slot(slot, &encl->page_tree, &iter, 0) {
+			entry = *slot;
+			addr = SGX_ENCL_PAGE_ADDR(entry);
+			if ((entry->desc & SGX_ENCL_PAGE_LOADED) &&
+			    (entry->desc & SGX_ENCL_PAGE_TCS) &&
+			    !sgx_encl_find(encl->mm, addr, &vma))
+				zap_vma_ptes(vma, addr, PAGE_SIZE);
+		}
+		sgx_flush_cpus(encl);
+	}
 	radix_tree_for_each_slot(slot, &encl->page_tree, &iter, 0) {
 		entry = *slot;
-		addr = SGX_ENCL_PAGE_ADDR(entry);
-
+		/* If the page has RECLAIMED set, it is being reclaimed so we
+		 * need to check that and let the swapper thread to free the
+		 * page if this is the case.
+		 */
 		if ((entry->desc & SGX_ENCL_PAGE_LOADED) &&
-		    (entry->desc & SGX_ENCL_PAGE_TCS) &&
-		    !sgx_encl_find(encl->mm, addr, &vma))
-			zap_vma_ptes(vma, addr, PAGE_SIZE);
+		    !(entry->desc & SGX_ENCL_PAGE_RECLAIMED)) {
+			if (!__sgx_free_page(entry->epc_page))
+				entry->desc &= ~SGX_ENCL_PAGE_LOADED;
+		}
 	}
-
-	encl->flags |= SGX_ENCL_DEAD;
-
-	if (flush_cpus)
-		sgx_flush_cpus(encl);
-
-	sgx_encl_free_va_pages(encl);
 }
 
 static int sgx_measure(struct sgx_epc_page *secs_page,
@@ -116,8 +113,8 @@ static int sgx_measure(struct sgx_epc_page *secs_page,
 	if (!mrmask)
 		return ret;
 
-	secs = sgx_get_page(secs_page);
-	epc = sgx_get_page(epc_page);
+	secs = sgx_epc_addr(secs_page);
+	epc = sgx_epc_addr(epc_page);
 
 	for (i = 0, j = 1; i < 0x1000 && !ret; i += 0x100, j <<= 1) {
 		if (!(j & mrmask))
@@ -125,9 +122,6 @@ static int sgx_measure(struct sgx_epc_page *secs_page,
 
 		ret = __eextend(secs, (void *)((unsigned long)epc + i));
 	}
-
-	sgx_put_page(epc);
-	sgx_put_page(secs);
 
 	return ret;
 }
@@ -139,19 +133,14 @@ static int sgx_eadd(struct sgx_epc_page *secs_page,
 		    struct page *backing)
 {
 	struct sgx_pageinfo pginfo;
-	void *epc_page_vaddr;
 	int ret;
 
-	pginfo.contents = (unsigned long)kmap_atomic(backing);
-	pginfo.secs = (unsigned long)sgx_get_page(secs_page);
-	epc_page_vaddr = sgx_get_page(epc_page);
-
+	pginfo.secs = (unsigned long)sgx_epc_addr(secs_page);
 	pginfo.addr = linaddr;
 	pginfo.metadata = (unsigned long)secinfo;
-	ret = __eadd(&pginfo, epc_page_vaddr);
 
-	sgx_put_page(epc_page_vaddr);
-	sgx_put_page((void *)(unsigned long)pginfo.secs);
+	pginfo.contents = (unsigned long)kmap_atomic(backing);
+	ret = __eadd(&pginfo, sgx_epc_addr(epc_page));
 	kunmap_atomic((void *)(unsigned long)pginfo.contents);
 
 	return ret;
@@ -162,6 +151,7 @@ static bool sgx_process_add_page_req(struct sgx_add_page_req *req,
 {
 	struct sgx_encl_page *encl_page = req->encl_page;
 	struct sgx_encl *encl = req->encl;
+	struct sgx_secinfo secinfo;
 	struct vm_area_struct *vma;
 	pgoff_t backing_index;
 	struct page *backing;
@@ -181,7 +171,7 @@ static bool sgx_process_add_page_req(struct sgx_add_page_req *req,
 	if (IS_ERR(backing))
 		return false;
 
-	ret = vm_insert_pfn(vma, addr, SGX_EPC_PFN(epc_page));
+	ret = vm_insert_pfn(vma, addr, PFN_DOWN(epc_page->desc));
 	if (ret) {
 		sgx_err(encl, "%s: vm_insert_pfn() returned %d\n", __func__,
 			ret);
@@ -189,8 +179,15 @@ static bool sgx_process_add_page_req(struct sgx_add_page_req *req,
 		return false;
 	}
 
-	ret = sgx_eadd(encl->secs.epc_page, epc_page, addr, &req->secinfo,
-		       backing);
+	/*
+	 * The SECINFO field must be 64-byte aligned, copy it to a local
+	 * variable that is guaranteed to be aligned as req->secinfo may
+	 * or may not be 64-byte aligned, e.g. req may have been allocated
+	 * via kzalloc which is not aware of __aligned attributes.
+	 */
+	memcpy(&secinfo, &req->secinfo, sizeof(secinfo));
+
+	ret = sgx_eadd(encl->secs.epc_page, epc_page, addr, &secinfo, backing);
 
 	sgx_put_backing(backing, false);
 	if (ret) {
@@ -226,10 +223,10 @@ static void sgx_add_page_worker(struct work_struct *work)
 	do {
 		schedule();
 
+		mutex_lock(&encl->lock);
 		if (encl->flags & SGX_ENCL_DEAD)
 			skip_rest = true;
 
-		mutex_lock(&encl->lock);
 		req = list_first_entry(&encl->add_page_reqs,
 				       struct sgx_add_page_req, list);
 		list_del(&req->list);
@@ -298,20 +295,14 @@ static int sgx_validate_secs(const struct sgx_secs *secs,
 		return -EINVAL;
 
 	if (secs->attributes & SGX_ATTR_MODE64BIT) {
-#ifdef CONFIG_X86_64
 		if (secs->size > sgx_encl_size_max_64)
 			return -EINVAL;
-#else
-		return -EINVAL;
-#endif
 	} else {
 		/* On 64-bit architecture allow 32-bit encls only in
 		 * the compatibility mode.
 		 */
-#ifdef CONFIG_X86_64
 		if (!test_thread_flag(TIF_ADDR32))
 			return -EINVAL;
-#endif
 		if (secs->size > sgx_encl_size_max_32)
 			return -EINVAL;
 	}
@@ -364,6 +355,9 @@ static int sgx_encl_grow(struct sgx_encl *encl)
 {
 	struct sgx_va_page *va_page;
 	int ret;
+
+	BUILD_BUG_ON(SGX_VA_SLOT_COUNT !=
+		(SGX_ENCL_PAGE_VA_OFFSET_MASK >> 3) + 1);
 
 	mutex_lock(&encl->lock);
 	if (!(encl->page_cnt % SGX_VA_SLOT_COUNT)) {
@@ -455,6 +449,21 @@ struct sgx_encl *sgx_encl_alloc(struct sgx_secs *secs)
 	return encl;
 }
 
+static int sgx_encl_pm_notifier(struct notifier_block *nb,
+				unsigned long action, void *data)
+{
+	struct sgx_encl *encl = container_of(nb, struct sgx_encl, pm_notifier);
+
+	if (action != PM_SUSPEND_PREPARE && action != PM_HIBERNATION_PREPARE)
+		return NOTIFY_DONE;
+
+	mutex_lock(&encl->lock);
+	sgx_invalidate(encl, false);
+	encl->flags |= SGX_ENCL_SUSPEND;
+	mutex_unlock(&encl->lock);
+	flush_work(&encl->add_page_work);
+	return NOTIFY_DONE;
+}
 
 /**
  * sgx_encl_create - create an enclave
@@ -475,7 +484,6 @@ int sgx_encl_create(struct sgx_encl *encl, struct sgx_secs *secs)
 	struct sgx_pageinfo pginfo;
 	struct sgx_secinfo secinfo;
 	struct sgx_epc_page *secs_epc;
-	void *secs_vaddr;
 	long ret;
 
 	secs_epc = sgx_alloc_page(&encl->secs.impl, 0);
@@ -493,16 +501,12 @@ int sgx_encl_create(struct sgx_encl *encl, struct sgx_secs *secs)
 	if (ret)
 		return ret;
 
-	secs_vaddr = sgx_get_page(secs_epc);
-
 	pginfo.addr = 0;
 	pginfo.contents = (unsigned long)secs;
 	pginfo.metadata = (unsigned long)&secinfo;
 	pginfo.secs = 0;
 	memset(&secinfo, 0, sizeof(secinfo));
-	ret = __ecreate((void *)&pginfo, secs_vaddr);
-
-	sgx_put_page(secs_vaddr);
+	ret = __ecreate((void *)&pginfo, sgx_epc_addr(secs_epc));
 
 	if (ret) {
 		sgx_dbg(encl, "ECREATE returned %ld\n", ret);
@@ -518,6 +522,13 @@ int sgx_encl_create(struct sgx_encl *encl, struct sgx_secs *secs)
 		if (ret == -EINTR)
 			ret = -ERESTARTSYS;
 		encl->mmu_notifier.ops = NULL;
+		return ret;
+	}
+
+	encl->pm_notifier.notifier_call = &sgx_encl_pm_notifier;
+	ret = register_pm_notifier(&encl->pm_notifier);
+	if (ret) {
+		encl->pm_notifier.notifier_call = NULL;
 		return ret;
 	}
 
@@ -555,7 +566,7 @@ static int sgx_validate_secinfo(struct sgx_secinfo *secinfo)
 	     page_type != SGX_SECINFO_REG))
 		return -EINVAL;
 
-	for (i = 0; i < sizeof(secinfo->reserved) / sizeof(u64); i++)
+	for (i = 0; i < SGX_SECINFO_RESERVED_SIZE; i++)
 		if (secinfo->reserved[i])
 			return -EINVAL;
 
@@ -687,9 +698,7 @@ void sgx_encl_free_page(struct sgx_encl_page *encl_page)
 	radix_tree_delete(&encl_page->encl->page_tree,
 			  PFN_DOWN(encl_page->desc));
 	if (encl_page->desc & SGX_ENCL_PAGE_LOADED) {
-		spin_lock(&sgx_active_page_list_lock);
-		list_del(&encl_page->epc_page->list);
-		spin_unlock(&sgx_active_page_list_lock);
+		WARN_ON(encl_page->desc & SGX_ENCL_PAGE_RECLAIMED);
 		sgx_free_page(encl_page->epc_page);
 	}
 	kfree(encl_page);
@@ -806,6 +815,10 @@ int sgx_encl_init(struct sgx_encl *encl, struct sgx_sigstruct *sigstruct,
 		mutex_unlock(&encl->lock);
 		return 0;
 	}
+	if (encl->flags & SGX_ENCL_DEAD) {
+		mutex_unlock(&encl->lock);
+		return -EFAULT;
+	}
 
 	for (i = 0; i < SGX_EINIT_SLEEP_COUNT; i++) {
 		for (j = 0; j < SGX_EINIT_SPIN_COUNT; j++) {
@@ -850,10 +863,11 @@ static int sgx_encl_mod(struct sgx_encl_page *encl_page,
 	sgx_encl_block(encl_page);
 
 	if (perm)
-		ret = sgx_emodpr(secinfo, encl_page->epc_page);
+		ret = __emodpr(secinfo, sgx_epc_addr(encl_page->epc_page));
 	else
-		ret = sgx_emodt(secinfo, encl_page->epc_page);
-	SGX_INVD(ret, encl, "EMOD%s returned %d\n", perm ? "PR" : "T", ret);
+		ret = __emodt(secinfo, sgx_epc_addr(encl_page->epc_page));
+	SGX_INVD(ret, encl, "EMOD%s returned %d (0x%x)",
+		 perm ? "PR" : "T", ret, ret);
 	return ret;
 }
 
@@ -949,8 +963,8 @@ void sgx_encl_block(struct sgx_encl_page *encl_page)
 		return;
 
 	zap_vma_ptes(vma, addr, PAGE_SIZE);
-	ret = sgx_eblock(encl_page->epc_page);
-	SGX_INVD(ret, encl, "EBLOCK returned %d\n", ret);
+	ret = __eblock(sgx_epc_addr(encl_page->epc_page));
+	SGX_INVD(ret, encl, "EBLOCK returned %d (0x%x)", ret, ret);
 }
 
 /**
@@ -968,7 +982,7 @@ void sgx_encl_block(struct sgx_encl_page *encl_page)
  */
 void sgx_encl_track(struct sgx_encl *encl)
 {
-	int ret = sgx_etrack(encl->secs.epc_page);
+	int ret = __etrack(sgx_epc_addr(encl->secs.epc_page));
 
 	SGX_INVD(ret, encl, "ETRACK returned %d\n", ret);
 }
@@ -990,11 +1004,9 @@ int sgx_encl_load_page(struct sgx_encl_page *encl_page,
 	struct sgx_pageinfo pginfo;
 	unsigned long pcmd_offset;
 	unsigned long va_offset;
-	void *secs_ptr = NULL;
 	pgoff_t backing_index;
 	struct page *backing;
 	struct page *pcmd;
-	void *epc_ptr;
 	void *va_ptr;
 	int ret;
 
@@ -1012,29 +1024,23 @@ int sgx_encl_load_page(struct sgx_encl_page *encl_page,
 		return PTR_ERR(pcmd);
 	}
 
-	if (addr)
-		secs_ptr = sgx_get_page(encl->secs.epc_page);
 
-	epc_ptr = sgx_get_page(epc_page);
-	va_ptr = sgx_get_page(encl_page->va_page->epc_page);
+	va_ptr = sgx_epc_addr(encl_page->va_page->epc_page) + va_offset;
+
 	pginfo.addr = addr;
 	pginfo.contents = (unsigned long)kmap_atomic(backing);
 	pginfo.metadata = (unsigned long)kmap_atomic(pcmd) + pcmd_offset;
-	pginfo.secs = (unsigned long)secs_ptr;
+	pginfo.secs = addr ? (unsigned long)sgx_epc_addr(encl->secs.epc_page) :
+		      0;
 
-	ret = __eldu(&pginfo, epc_ptr, va_ptr + va_offset);
+	ret = __eldu(&pginfo, sgx_epc_addr(epc_page), va_ptr);
 	if (ret) {
 		sgx_err(encl, "ELDU returned %d\n", ret);
-		ret = ENCLS_TO_ERR(ret);
+		ret = encls_to_err(ret);
 	}
 
 	kunmap_atomic((void *)(unsigned long)(pginfo.metadata - pcmd_offset));
 	kunmap_atomic((void *)(unsigned long)pginfo.contents);
-	sgx_put_page(va_ptr);
-	sgx_put_page(epc_ptr);
-
-	if (addr)
-		sgx_put_page(secs_ptr);
 
 	sgx_put_backing(pcmd, false);
 	sgx_put_backing(backing, false);
@@ -1042,41 +1048,62 @@ int sgx_encl_load_page(struct sgx_encl_page *encl_page,
 }
 
 /**
- * sgx_encl_release - destroy an enclave
+ * sgx_encl_release - destroy an enclave instance
  *
- * @kref:	address of the kref inside &sgx_encl
+ * @kref:	address of a kref inside &sgx_encl
  *
- * Used togethere with kref_put(). Frees all the resources associated with
- * the enclave.
+ * Used together with kref_put(). Frees all the resources associated with the
+ * enclave and the instance itself.
  */
 void sgx_encl_release(struct kref *ref)
 {
 	struct sgx_encl *encl = container_of(ref, struct sgx_encl, refcount);
 	struct sgx_encl_page *entry;
 	struct radix_tree_iter iter;
+	struct sgx_va_page *va_page;
 	void **slot;
+
+	if (encl->mmu_notifier.ops) {
+		mmu_notifier_unregister_no_release(&encl->mmu_notifier,
+						   encl->mm);
+		encl->mmu_notifier.ops = NULL;
+	}
+
+	if (encl->pm_notifier.notifier_call) {
+		unregister_pm_notifier(&encl->pm_notifier);
+		encl->pm_notifier.notifier_call = NULL;
+	}
 
 	radix_tree_for_each_slot(slot, &encl->page_tree, &iter, 0) {
 		entry = *slot;
 		sgx_encl_free_page(entry);
 	}
 
-	put_pid(encl->tgid);
+	if (encl->tgid) {
+		put_pid(encl->tgid);
+		encl->tgid = NULL;
+	}
 
-	if (encl->mmu_notifier.ops)
-		mmu_notifier_unregister_no_release(&encl->mmu_notifier,
-						   encl->mm);
-
-	sgx_encl_free_va_pages(encl);
+	while (!list_empty(&encl->va_pages)) {
+		va_page = list_first_entry(&encl->va_pages, struct sgx_va_page,
+					   list);
+		list_del(&va_page->list);
+		sgx_free_page(va_page->epc_page);
+		kfree(va_page);
+	}
 
 	if (encl->secs.desc & SGX_ENCL_PAGE_LOADED)
 		sgx_free_page(encl->secs.epc_page);
 
-	if (encl->backing)
+	if (encl->backing) {
 		fput(encl->backing);
+		encl->backing = NULL;
+	}
 
-	if (encl->pcmd)
+	if (encl->pcmd) {
 		fput(encl->pcmd);
+		encl->pcmd = NULL;
+	}
 
 	kfree(encl);
 }

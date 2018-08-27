@@ -172,6 +172,17 @@ void recalc_sigpending(void)
 
 }
 
+void calculate_sigpending(void)
+{
+	/* Have any signals or users of TIF_SIGPENDING been delayed
+	 * until after fork?
+	 */
+	spin_lock_irq(&current->sighand->siglock);
+	set_tsk_thread_flag(current, TIF_SIGPENDING);
+	recalc_sigpending();
+	spin_unlock_irq(&current->sighand->siglock);
+}
+
 /* Given the mask, find the first available signal that should be serviced. */
 
 #define SYNCHRONOUS_MASK \
@@ -360,6 +371,20 @@ static bool task_participate_group_stop(struct task_struct *task)
 		return true;
 	}
 	return false;
+}
+
+void task_join_group_stop(struct task_struct *task)
+{
+	/* Have the new thread join an on-going signal group stop */
+	unsigned long jobctl = current->jobctl;
+	if (jobctl & JOBCTL_STOP_PENDING) {
+		struct signal_struct *sig = current->signal;
+		unsigned long signr = jobctl & JOBCTL_STOP_SIGMASK;
+		unsigned long gstop = JOBCTL_STOP_PENDING | JOBCTL_STOP_CONSUME;
+		if (task_set_jobctl_pending(task, signr | gstop)) {
+			sig->group_stop_count++;
+		}
+	}
 }
 
 /*
@@ -895,7 +920,7 @@ static inline int wants_signal(int sig, struct task_struct *p)
 	return task_curr(p) || !signal_pending(p);
 }
 
-static void complete_signal(int sig, struct task_struct *p, int group)
+static void complete_signal(int sig, struct task_struct *p, enum pid_type type)
 {
 	struct signal_struct *signal = p->signal;
 	struct task_struct *t;
@@ -908,7 +933,7 @@ static void complete_signal(int sig, struct task_struct *p, int group)
 	 */
 	if (wants_signal(sig, p))
 		t = p;
-	else if (!group || thread_group_empty(p))
+	else if ((type == PIDTYPE_PID) || thread_group_empty(p))
 		/*
 		 * There is just one thread and it does not need to be woken.
 		 * It will dequeue unblocked signals before it runs again.
@@ -998,7 +1023,7 @@ static inline void userns_fixup_signal_uid(struct siginfo *info, struct task_str
 #endif
 
 static int __send_signal(int sig, struct siginfo *info, struct task_struct *t,
-			int group, int from_ancestor_ns)
+			enum pid_type type, int from_ancestor_ns)
 {
 	struct sigpending *pending;
 	struct sigqueue *q;
@@ -1012,7 +1037,7 @@ static int __send_signal(int sig, struct siginfo *info, struct task_struct *t,
 			from_ancestor_ns || (info == SEND_SIG_FORCED)))
 		goto ret;
 
-	pending = group ? &t->signal->shared_pending : &t->pending;
+	pending = (type != PIDTYPE_PID) ? &t->signal->shared_pending : &t->pending;
 	/*
 	 * Short-circuit ignored signals and support queuing
 	 * exactly one non-rt signal, so that we can get more
@@ -1096,14 +1121,29 @@ static int __send_signal(int sig, struct siginfo *info, struct task_struct *t,
 out_set:
 	signalfd_notify(t, sig);
 	sigaddset(&pending->signal, sig);
-	complete_signal(sig, t, group);
+
+	/* Let multiprocess signals appear after on-going forks */
+	if (type > PIDTYPE_TGID) {
+		struct multiprocess_signals *delayed;
+		hlist_for_each_entry(delayed, &t->signal->multiprocess, node) {
+			sigset_t *signal = &delayed->signal;
+			/* Can't queue both a stop and a continue signal */
+			if (sig == SIGCONT)
+				sigdelsetmask(signal, SIG_KERNEL_STOP_MASK);
+			else if (sig_kernel_stop(sig))
+				sigdelset(signal, SIGCONT);
+			sigaddset(signal, sig);
+		}
+	}
+
+	complete_signal(sig, t, type);
 ret:
-	trace_signal_generate(sig, info, t, group, result);
+	trace_signal_generate(sig, info, t, type != PIDTYPE_PID, result);
 	return ret;
 }
 
 static int send_signal(int sig, struct siginfo *info, struct task_struct *t,
-			int group)
+			enum pid_type type)
 {
 	int from_ancestor_ns = 0;
 
@@ -1112,7 +1152,7 @@ static int send_signal(int sig, struct siginfo *info, struct task_struct *t,
 			   !task_pid_nr_ns(current, task_active_pid_ns(t));
 #endif
 
-	return __send_signal(sig, info, t, group, from_ancestor_ns);
+	return __send_signal(sig, info, t, type, from_ancestor_ns);
 }
 
 static void print_fatal_signal(int signr)
@@ -1151,23 +1191,23 @@ __setup("print-fatal-signals=", setup_print_fatal_signals);
 int
 __group_send_sig_info(int sig, struct siginfo *info, struct task_struct *p)
 {
-	return send_signal(sig, info, p, 1);
+	return send_signal(sig, info, p, PIDTYPE_TGID);
 }
 
 static int
 specific_send_sig_info(int sig, struct siginfo *info, struct task_struct *t)
 {
-	return send_signal(sig, info, t, 0);
+	return send_signal(sig, info, t, PIDTYPE_PID);
 }
 
 int do_send_sig_info(int sig, struct siginfo *info, struct task_struct *p,
-			bool group)
+			enum pid_type type)
 {
 	unsigned long flags;
 	int ret = -ESRCH;
 
 	if (lock_task_sighand(p, &flags)) {
-		ret = send_signal(sig, info, p, group);
+		ret = send_signal(sig, info, p, type);
 		unlock_task_sighand(p, &flags);
 	}
 
@@ -1244,19 +1284,12 @@ struct sighand_struct *__lock_task_sighand(struct task_struct *tsk,
 {
 	struct sighand_struct *sighand;
 
+	rcu_read_lock();
 	for (;;) {
-		/*
-		 * Disable interrupts early to avoid deadlocks.
-		 * See rcu_read_unlock() comment header for details.
-		 */
-		local_irq_save(*flags);
-		rcu_read_lock();
 		sighand = rcu_dereference(tsk->sighand);
-		if (unlikely(sighand == NULL)) {
-			rcu_read_unlock();
-			local_irq_restore(*flags);
+		if (unlikely(sighand == NULL))
 			break;
-		}
+
 		/*
 		 * This sighand can be already freed and even reused, but
 		 * we rely on SLAB_TYPESAFE_BY_RCU and sighand_ctor() which
@@ -1268,15 +1301,12 @@ struct sighand_struct *__lock_task_sighand(struct task_struct *tsk,
 		 * __exit_signal(). In the latter case the next iteration
 		 * must see ->sighand == NULL.
 		 */
-		spin_lock(&sighand->siglock);
-		if (likely(sighand == tsk->sighand)) {
-			rcu_read_unlock();
+		spin_lock_irqsave(&sighand->siglock, *flags);
+		if (likely(sighand == tsk->sighand))
 			break;
-		}
-		spin_unlock(&sighand->siglock);
-		rcu_read_unlock();
-		local_irq_restore(*flags);
+		spin_unlock_irqrestore(&sighand->siglock, *flags);
 	}
+	rcu_read_unlock();
 
 	return sighand;
 }
@@ -1284,7 +1314,8 @@ struct sighand_struct *__lock_task_sighand(struct task_struct *tsk,
 /*
  * send signal info to all the members of a group
  */
-int group_send_sig_info(int sig, struct siginfo *info, struct task_struct *p)
+int group_send_sig_info(int sig, struct siginfo *info, struct task_struct *p,
+			enum pid_type type)
 {
 	int ret;
 
@@ -1293,7 +1324,7 @@ int group_send_sig_info(int sig, struct siginfo *info, struct task_struct *p)
 	rcu_read_unlock();
 
 	if (!ret && sig)
-		ret = do_send_sig_info(sig, info, p, true);
+		ret = do_send_sig_info(sig, info, p, type);
 
 	return ret;
 }
@@ -1311,7 +1342,7 @@ int __kill_pgrp_info(int sig, struct siginfo *info, struct pid *pgrp)
 	success = 0;
 	retval = -ESRCH;
 	do_each_pid_task(pgrp, PIDTYPE_PGID, p) {
-		int err = group_send_sig_info(sig, info, p);
+		int err = group_send_sig_info(sig, info, p, PIDTYPE_PGID);
 		success |= !err;
 		retval = err;
 	} while_each_pid_task(pgrp, PIDTYPE_PGID, p);
@@ -1327,7 +1358,7 @@ int kill_pid_info(int sig, struct siginfo *info, struct pid *pid)
 		rcu_read_lock();
 		p = pid_task(pid, PIDTYPE_PID);
 		if (p)
-			error = group_send_sig_info(sig, info, p);
+			error = group_send_sig_info(sig, info, p, PIDTYPE_TGID);
 		rcu_read_unlock();
 		if (likely(!p || error != -ESRCH))
 			return error;
@@ -1386,7 +1417,7 @@ int kill_pid_info_as_cred(int sig, struct siginfo *info, struct pid *pid,
 
 	if (sig) {
 		if (lock_task_sighand(p, &flags)) {
-			ret = __send_signal(sig, info, p, 1, 0);
+			ret = __send_signal(sig, info, p, PIDTYPE_TGID, 0);
 			unlock_task_sighand(p, &flags);
 		} else
 			ret = -ESRCH;
@@ -1430,7 +1461,8 @@ static int kill_something_info(int sig, struct siginfo *info, pid_t pid)
 		for_each_process(p) {
 			if (task_pid_vnr(p) > 1 &&
 					!same_thread_group(p, current)) {
-				int err = group_send_sig_info(sig, info, p);
+				int err = group_send_sig_info(sig, info, p,
+							      PIDTYPE_MAX);
 				++count;
 				if (err != -EPERM)
 					retval = err;
@@ -1456,7 +1488,7 @@ int send_sig_info(int sig, struct siginfo *info, struct task_struct *p)
 	if (!valid_signal(sig))
 		return -EINVAL;
 
-	return do_send_sig_info(sig, info, p, false);
+	return do_send_sig_info(sig, info, p, PIDTYPE_PID);
 }
 
 #define __si_special(priv) \
@@ -1539,7 +1571,6 @@ int send_sig_fault(int sig, int code, void __user *addr
 	return send_sig_info(info.si_signo, &info, t);
 }
 
-#if defined(BUS_MCEERR_AO) && defined(BUS_MCEERR_AR)
 int force_sig_mceerr(int code, void __user *addr, short lsb, struct task_struct *t)
 {
 	struct siginfo info;
@@ -1568,9 +1599,7 @@ int send_sig_mceerr(int code, void __user *addr, short lsb, struct task_struct *
 	return send_sig_info(info.si_signo, &info, t);
 }
 EXPORT_SYMBOL(send_sig_mceerr);
-#endif
 
-#ifdef SEGV_BNDERR
 int force_sig_bnderr(void __user *addr, void __user *lower, void __user *upper)
 {
 	struct siginfo info;
@@ -1584,7 +1613,6 @@ int force_sig_bnderr(void __user *addr, void __user *lower, void __user *upper)
 	info.si_upper = upper;
 	return force_sig_info(info.si_signo, &info, current);
 }
-#endif
 
 #ifdef SEGV_PKUERR
 int force_sig_pkuerr(void __user *addr, u32 pkey)
@@ -1678,17 +1706,20 @@ void sigqueue_free(struct sigqueue *q)
 		__sigqueue_free(q);
 }
 
-int send_sigqueue(struct sigqueue *q, struct task_struct *t, int group)
+int send_sigqueue(struct sigqueue *q, struct pid *pid, enum pid_type type)
 {
 	int sig = q->info.si_signo;
 	struct sigpending *pending;
+	struct task_struct *t;
 	unsigned long flags;
 	int ret, result;
 
 	BUG_ON(!(q->flags & SIGQUEUE_PREALLOC));
 
 	ret = -1;
-	if (!likely(lock_task_sighand(t, &flags)))
+	rcu_read_lock();
+	t = pid_task(pid, type);
+	if (!t || !likely(lock_task_sighand(t, &flags)))
 		goto ret;
 
 	ret = 1; /* the signal is ignored */
@@ -1710,15 +1741,16 @@ int send_sigqueue(struct sigqueue *q, struct task_struct *t, int group)
 	q->info.si_overrun = 0;
 
 	signalfd_notify(t, sig);
-	pending = group ? &t->signal->shared_pending : &t->pending;
+	pending = (type != PIDTYPE_PID) ? &t->signal->shared_pending : &t->pending;
 	list_add_tail(&q->list, &pending->list);
 	sigaddset(&pending->signal, sig);
-	complete_signal(sig, t, group);
+	complete_signal(sig, t, type);
 	result = TRACE_SIGNAL_DELIVERED;
 out:
-	trace_signal_generate(sig, &q->info, t, group, result);
+	trace_signal_generate(sig, &q->info, t, type != PIDTYPE_PID, result);
 	unlock_task_sighand(t, &flags);
 ret:
+	rcu_read_unlock();
 	return ret;
 }
 
@@ -2837,8 +2869,19 @@ enum siginfo_layout siginfo_layout(int sig, int si_code)
 			[SIGPOLL] = { NSIGPOLL, SIL_POLL },
 			[SIGSYS]  = { NSIGSYS,  SIL_SYS },
 		};
-		if ((sig < ARRAY_SIZE(filter)) && (si_code <= filter[sig].limit))
+		if ((sig < ARRAY_SIZE(filter)) && (si_code <= filter[sig].limit)) {
 			layout = filter[sig].layout;
+			/* Handle the exceptions */
+			if ((sig == SIGBUS) &&
+			    (si_code >= BUS_MCEERR_AR) && (si_code <= BUS_MCEERR_AO))
+				layout = SIL_FAULT_MCEERR;
+			else if ((sig == SIGSEGV) && (si_code == SEGV_BNDERR))
+				layout = SIL_FAULT_BNDERR;
+#ifdef SEGV_PKUERR
+			else if ((sig == SIGSEGV) && (si_code == SEGV_PKUERR))
+				layout = SIL_FAULT_PKUERR;
+#endif
+		}
 		else if (si_code <= NSIGPOLL)
 			layout = SIL_POLL;
 	} else {
@@ -2848,104 +2891,15 @@ enum siginfo_layout siginfo_layout(int sig, int si_code)
 			layout = SIL_POLL;
 		else if (si_code < 0)
 			layout = SIL_RT;
-		/* Tests to support buggy kernel ABIs */
-#ifdef TRAP_FIXME
-		if ((sig == SIGTRAP) && (si_code == TRAP_FIXME))
-			layout = SIL_FAULT;
-#endif
-#ifdef FPE_FIXME
-		if ((sig == SIGFPE) && (si_code == FPE_FIXME))
-			layout = SIL_FAULT;
-#endif
 	}
 	return layout;
 }
 
 int copy_siginfo_to_user(siginfo_t __user *to, const siginfo_t *from)
 {
-	int err;
-
-	if (!access_ok (VERIFY_WRITE, to, sizeof(siginfo_t)))
+	if (copy_to_user(to, from , sizeof(struct siginfo)))
 		return -EFAULT;
-	if (from->si_code < 0)
-		return __copy_to_user(to, from, sizeof(siginfo_t))
-			? -EFAULT : 0;
-	/*
-	 * If you change siginfo_t structure, please be sure
-	 * this code is fixed accordingly.
-	 * Please remember to update the signalfd_copyinfo() function
-	 * inside fs/signalfd.c too, in case siginfo_t changes.
-	 * It should never copy any pad contained in the structure
-	 * to avoid security leaks, but must copy the generic
-	 * 3 ints plus the relevant union member.
-	 */
-	err = __put_user(from->si_signo, &to->si_signo);
-	err |= __put_user(from->si_errno, &to->si_errno);
-	err |= __put_user(from->si_code, &to->si_code);
-	switch (siginfo_layout(from->si_signo, from->si_code)) {
-	case SIL_KILL:
-		err |= __put_user(from->si_pid, &to->si_pid);
-		err |= __put_user(from->si_uid, &to->si_uid);
-		break;
-	case SIL_TIMER:
-		/* Unreached SI_TIMER is negative */
-		break;
-	case SIL_POLL:
-		err |= __put_user(from->si_band, &to->si_band);
-		err |= __put_user(from->si_fd, &to->si_fd);
-		break;
-	case SIL_FAULT:
-		err |= __put_user(from->si_addr, &to->si_addr);
-#ifdef __ARCH_SI_TRAPNO
-		err |= __put_user(from->si_trapno, &to->si_trapno);
-#endif
-#ifdef __ia64__
-		err |= __put_user(from->si_imm, &to->si_imm);
-		err |= __put_user(from->si_flags, &to->si_flags);
-		err |= __put_user(from->si_isr, &to->si_isr);
-#endif
-		/*
-		 * Other callers might not initialize the si_lsb field,
-		 * so check explicitly for the right codes here.
-		 */
-#ifdef BUS_MCEERR_AR
-		if (from->si_signo == SIGBUS && from->si_code == BUS_MCEERR_AR)
-			err |= __put_user(from->si_addr_lsb, &to->si_addr_lsb);
-#endif
-#ifdef BUS_MCEERR_AO
-		if (from->si_signo == SIGBUS && from->si_code == BUS_MCEERR_AO)
-			err |= __put_user(from->si_addr_lsb, &to->si_addr_lsb);
-#endif
-#ifdef SEGV_BNDERR
-		if (from->si_signo == SIGSEGV && from->si_code == SEGV_BNDERR) {
-			err |= __put_user(from->si_lower, &to->si_lower);
-			err |= __put_user(from->si_upper, &to->si_upper);
-		}
-#endif
-#ifdef SEGV_PKUERR
-		if (from->si_signo == SIGSEGV && from->si_code == SEGV_PKUERR)
-			err |= __put_user(from->si_pkey, &to->si_pkey);
-#endif
-		break;
-	case SIL_CHLD:
-		err |= __put_user(from->si_pid, &to->si_pid);
-		err |= __put_user(from->si_uid, &to->si_uid);
-		err |= __put_user(from->si_status, &to->si_status);
-		err |= __put_user(from->si_utime, &to->si_utime);
-		err |= __put_user(from->si_stime, &to->si_stime);
-		break;
-	case SIL_RT:
-		err |= __put_user(from->si_pid, &to->si_pid);
-		err |= __put_user(from->si_uid, &to->si_uid);
-		err |= __put_user(from->si_ptr, &to->si_ptr);
-		break;
-	case SIL_SYS:
-		err |= __put_user(from->si_call_addr, &to->si_call_addr);
-		err |= __put_user(from->si_syscall, &to->si_syscall);
-		err |= __put_user(from->si_arch, &to->si_arch);
-		break;
-	}
-	return err;
+	return 0;
 }
 
 #ifdef CONFIG_COMPAT
@@ -2984,27 +2938,28 @@ int __copy_siginfo_to_user32(struct compat_siginfo __user *to,
 #ifdef __ARCH_SI_TRAPNO
 		new.si_trapno = from->si_trapno;
 #endif
-#ifdef BUS_MCEERR_AR
-		if ((from->si_signo == SIGBUS) && (from->si_code == BUS_MCEERR_AR))
-			new.si_addr_lsb = from->si_addr_lsb;
+		break;
+	case SIL_FAULT_MCEERR:
+		new.si_addr = ptr_to_compat(from->si_addr);
+#ifdef __ARCH_SI_TRAPNO
+		new.si_trapno = from->si_trapno;
 #endif
-#ifdef BUS_MCEERR_AO
-		if ((from->si_signo == SIGBUS) && (from->si_code == BUS_MCEERR_AO))
-			new.si_addr_lsb = from->si_addr_lsb;
+		new.si_addr_lsb = from->si_addr_lsb;
+		break;
+	case SIL_FAULT_BNDERR:
+		new.si_addr = ptr_to_compat(from->si_addr);
+#ifdef __ARCH_SI_TRAPNO
+		new.si_trapno = from->si_trapno;
 #endif
-#ifdef SEGV_BNDERR
-		if ((from->si_signo == SIGSEGV) &&
-		    (from->si_code == SEGV_BNDERR)) {
-			new.si_lower = ptr_to_compat(from->si_lower);
-			new.si_upper = ptr_to_compat(from->si_upper);
-		}
+		new.si_lower = ptr_to_compat(from->si_lower);
+		new.si_upper = ptr_to_compat(from->si_upper);
+		break;
+	case SIL_FAULT_PKUERR:
+		new.si_addr = ptr_to_compat(from->si_addr);
+#ifdef __ARCH_SI_TRAPNO
+		new.si_trapno = from->si_trapno;
 #endif
-#ifdef SEGV_PKUERR
-		if ((from->si_signo == SIGSEGV) &&
-		    (from->si_code == SEGV_PKUERR))
-			new.si_pkey = from->si_pkey;
-#endif
-
+		new.si_pkey = from->si_pkey;
 		break;
 	case SIL_CHLD:
 		new.si_pid    = from->si_pid;
@@ -3070,24 +3025,28 @@ int copy_siginfo_from_user32(struct siginfo *to,
 #ifdef __ARCH_SI_TRAPNO
 		to->si_trapno = from.si_trapno;
 #endif
-#ifdef BUS_MCEERR_AR
-		if ((from.si_signo == SIGBUS) && (from.si_code == BUS_MCEERR_AR))
-			to->si_addr_lsb = from.si_addr_lsb;
+		break;
+	case SIL_FAULT_MCEERR:
+		to->si_addr = compat_ptr(from.si_addr);
+#ifdef __ARCH_SI_TRAPNO
+		to->si_trapno = from.si_trapno;
 #endif
-#ifdef BUS_MCEER_AO
-		if ((from.si_signo == SIGBUS) && (from.si_code == BUS_MCEERR_AO))
-			to->si_addr_lsb = from.si_addr_lsb;
+		to->si_addr_lsb = from.si_addr_lsb;
+		break;
+	case SIL_FAULT_BNDERR:
+		to->si_addr = compat_ptr(from.si_addr);
+#ifdef __ARCH_SI_TRAPNO
+		to->si_trapno = from.si_trapno;
 #endif
-#ifdef SEGV_BNDERR
-		if ((from.si_signo == SIGSEGV) && (from.si_code == SEGV_BNDERR)) {
-			to->si_lower = compat_ptr(from.si_lower);
-			to->si_upper = compat_ptr(from.si_upper);
-		}
+		to->si_lower = compat_ptr(from.si_lower);
+		to->si_upper = compat_ptr(from.si_upper);
+		break;
+	case SIL_FAULT_PKUERR:
+		to->si_addr = compat_ptr(from.si_addr);
+#ifdef __ARCH_SI_TRAPNO
+		to->si_trapno = from.si_trapno;
 #endif
-#ifdef SEGV_PKUERR
-		if ((from.si_signo == SIGSEGV) && (from.si_code == SEGV_PKUERR))
-			to->si_pkey = from.si_pkey;
-#endif
+		to->si_pkey = from.si_pkey;
 		break;
 	case SIL_CHLD:
 		to->si_pid    = from.si_pid;
@@ -3280,7 +3239,7 @@ do_send_specific(pid_t tgid, pid_t pid, int sig, struct siginfo *info)
 		 * probe.  No signal is actually delivered.
 		 */
 		if (!error && sig) {
-			error = do_send_sig_info(sig, info, p, false);
+			error = do_send_sig_info(sig, info, p, PIDTYPE_PID);
 			/*
 			 * If lock_task_sighand() failed we pretend the task
 			 * dies after receiving the signal. The window is tiny,
@@ -4047,7 +4006,7 @@ void kdb_send_sig(struct task_struct *t, int sig)
 			   "the deadlock.\n");
 		return;
 	}
-	ret = send_signal(sig, SEND_SIG_PRIV, t, false);
+	ret = send_signal(sig, SEND_SIG_PRIV, t, PIDTYPE_PID);
 	spin_unlock(&t->sighand->siglock);
 	if (ret)
 		kdb_printf("Fail to deliver Signal %d to process %d.\n",

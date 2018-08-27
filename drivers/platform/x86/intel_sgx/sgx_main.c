@@ -7,15 +7,9 @@
 #include <linux/suspend.h>
 #include "sgx.h"
 
-#define DRV_DESCRIPTION "Intel SGX Driver"
-
 MODULE_DESCRIPTION("Intel SGX Driver");
 MODULE_AUTHOR("Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>");
 MODULE_LICENSE("Dual BSD/GPL");
-
-/*
- * Global data.
- */
 
 struct workqueue_struct *sgx_add_page_wq;
 u64 sgx_encl_size_max_32;
@@ -49,22 +43,11 @@ static unsigned long sgx_get_unmapped_area(struct file *file,
 	if (len < 2 * PAGE_SIZE || (len & (len - 1)))
 		return -EINVAL;
 
-	/* On 64-bit architecture, allow mmap() to exceed 32-bit encl
-	 * limit only if the task is not running in 32-bit compatibility
-	 * mode.
-	 */
-	if (len > sgx_encl_size_max_32)
-#ifdef CONFIG_X86_64
-		if (test_thread_flag(TIF_ADDR32))
-			return -EINVAL;
-#else
-		return -EINVAL;
-#endif
-
-#ifdef CONFIG_X86_64
 	if (len > sgx_encl_size_max_64)
 		return -EINVAL;
-#endif
+
+	if (len > sgx_encl_size_max_32 && test_thread_flag(TIF_ADDR32))
+		return -EINVAL;
 
 	addr = current->mm->get_unmapped_area(file, addr, 2 * len, pgoff,
 					      flags);
@@ -85,26 +68,6 @@ static const struct file_operations sgx_fops = {
 	.mmap			= sgx_mmap,
 	.get_unmapped_area	= sgx_get_unmapped_area,
 };
-
-static int sgx_pm_suspend(struct device *dev)
-{
-	struct sgx_encl_page *encl_page;
-	struct sgx_epc_page *epc_page;
-	struct sgx_encl *encl;
-
-	list_for_each_entry(epc_page, &sgx_active_page_list, list) {
-		encl_page = container_of(epc_page->impl, struct sgx_encl_page,
-					 impl);
-		encl = encl_page->encl;
-		sgx_invalidate(encl, false);
-		encl->flags |= SGX_ENCL_SUSPEND;
-		flush_work(&encl->add_page_work);
-	}
-
-	return 0;
-}
-
-static SIMPLE_DEV_PM_OPS(sgx_drv_pm, sgx_pm_suspend, NULL);
 
 static struct bus_type sgx_bus_type = {
 	.name	= "sgx",
@@ -180,17 +143,14 @@ static int sgx_dev_init(struct device *parent)
 
 	sgx_dev = sgxm_ctx_alloc(parent);
 
-	cpuid_count(SGX_CPUID, SGX_CPUID_CAPABILITIES, &eax, &ebx, &ecx, &edx);
+	cpuid_count(SGX_CPUID, 0, &eax, &ebx, &ecx, &edx);
 	/* Only allow misc bits supported by the driver. */
 	sgx_misc_reserved = ~ebx | SGX_MISC_RESERVED_MASK;
-#ifdef CONFIG_X86_64
 	sgx_encl_size_max_64 = 1ULL << ((edx >> 8) & 0xFF);
-#endif
 	sgx_encl_size_max_32 = 1ULL << (edx & 0xFF);
 
 	if (boot_cpu_has(X86_FEATURE_OSXSAVE)) {
-		cpuid_count(SGX_CPUID, SGX_CPUID_ATTRIBUTES, &eax, &ebx, &ecx,
-			    &edx);
+		cpuid_count(SGX_CPUID, 1, &eax, &ebx, &ecx, &edx);
 		sgx_xfrm_mask = (((u64)edx) << 32) + (u64)ecx;
 
 		for (i = 2; i < 64; i++) {
@@ -246,7 +206,6 @@ static struct platform_driver sgx_drv = {
 	.remove = sgx_drv_remove,
 	.driver = {
 		.name			= "intel_sgx",
-		.pm			= &sgx_drv_pm,
 		.acpi_match_table	= ACPI_PTR(sgx_device_ids),
 	},
 };

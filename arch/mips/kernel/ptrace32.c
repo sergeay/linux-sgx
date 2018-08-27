@@ -103,13 +103,13 @@ long compat_arch_ptrace(struct task_struct *child, compat_long_t request,
 				/*
 				 * The odd registers are actually the high
 				 * order bits of the values stored in the even
-				 * registers - unless we're using r2k_switch.S.
+				 * registers.
 				 */
 				tmp = get_fpr32(&fregs[(addr & ~1) - FPR_BASE],
 						addr & 1);
 				break;
 			}
-			tmp = get_fpr32(&fregs[addr - FPR_BASE], 0);
+			tmp = get_fpr64(&fregs[addr - FPR_BASE], 0);
 			break;
 		case PC:
 			tmp = regs->cp0_epc;
@@ -142,7 +142,7 @@ long compat_arch_ptrace(struct task_struct *child, compat_long_t request,
 				goto out;
 			}
 			dregs = __get_dsp_regs(child);
-			tmp = (unsigned long) (dregs[addr - DSP_BASE]);
+			tmp = dregs[addr - DSP_BASE];
 			break;
 		}
 		case DSP_CONTROL:
@@ -216,7 +216,7 @@ long compat_arch_ptrace(struct task_struct *child, compat_long_t request,
 				/*
 				 * The odd registers are actually the high
 				 * order bits of the values stored in the even
-				 * registers - unless we're using r2k_switch.S.
+				 * registers.
 				 */
 				set_fpr32(&fregs[(addr & ~1) - FPR_BASE],
 					  addr & 1, data);

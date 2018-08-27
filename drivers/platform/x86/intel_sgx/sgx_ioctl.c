@@ -53,14 +53,16 @@ static long sgx_ioc_enclave_create(struct file *filep, unsigned int cmd,
 				   unsigned long arg)
 {
 	struct sgx_enclave_create *createp = (struct sgx_enclave_create *)arg;
+	struct page *secs_page;
 	struct sgx_secs *secs;
 	struct sgx_encl *encl;
 	int ret;
 
-	secs = kzalloc(sizeof(*secs),  GFP_KERNEL);
-	if (!secs)
+	secs_page = alloc_page(GFP_HIGHUSER);
+	if (!secs_page)
 		return -ENOMEM;
 
+	secs = kmap(secs_page);
 	ret = copy_from_user(secs, (void __user *)createp->src, sizeof(*secs));
 	if (ret)
 		goto out;
@@ -76,7 +78,8 @@ static long sgx_ioc_enclave_create(struct file *filep, unsigned int cmd,
 		kref_put(&encl->refcount, sgx_encl_release);
 
 out:
-	kfree(secs);
+	kunmap(secs_page);
+	__free_page(secs_page);
 	return ret;
 }
 
@@ -247,7 +250,7 @@ static long sgx_ioc_enclave_remove_pages(struct file *filep, unsigned int cmd,
 		}
 
 		zap_vma_ptes(vma, addr, PAGE_SIZE);
-		ret = sgx_free_page(page->epc_page);
+		ret = __sgx_free_page(page->epc_page);
 		if (ret) {
 			page->desc &= ~SGX_ENCL_PAGE_RESERVED;
 			break;

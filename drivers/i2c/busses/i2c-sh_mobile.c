@@ -613,11 +613,6 @@ static void sh_mobile_i2c_xfer_dma(struct sh_mobile_i2c_data *pd)
 static int start_ch(struct sh_mobile_i2c_data *pd, struct i2c_msg *usr_msg,
 		    bool do_init)
 {
-	if (usr_msg->len == 0 && (usr_msg->flags & I2C_M_RD)) {
-		dev_err(pd->dev, "Unsupported zero length i2c read\n");
-		return -EOPNOTSUPP;
-	}
-
 	if (do_init) {
 		/* Initialize channel registers */
 		iic_wr(pd, ICCR, ICCR_SCP);
@@ -756,6 +751,10 @@ static u32 sh_mobile_i2c_func(struct i2c_adapter *adapter)
 static const struct i2c_algorithm sh_mobile_i2c_algorithm = {
 	.functionality	= sh_mobile_i2c_func,
 	.master_xfer	= sh_mobile_i2c_xfer,
+};
+
+static const struct i2c_adapter_quirks sh_mobile_i2c_quirks = {
+	.flags = I2C_AQ_NO_ZERO_LEN_READ,
 };
 
 /*
@@ -899,17 +898,6 @@ static int sh_mobile_i2c_probe(struct platform_device *dev)
 	if (resource_size(res) > 0x17)
 		pd->flags |= IIC_FLAG_HAS_ICIC67;
 
-	/* Enable Runtime PM for this device.
-	 *
-	 * Also tell the Runtime PM core to ignore children
-	 * for this device since it is valid for us to suspend
-	 * this I2C master driver even though the slave devices
-	 * on the I2C bus may not be suspended.
-	 *
-	 * The state of the I2C hardware bus is unaffected by
-	 * the Runtime PM state.
-	 */
-	pm_suspend_ignore_children(&dev->dev, true);
 	pm_runtime_enable(&dev->dev);
 	pm_runtime_get_sync(&dev->dev);
 
@@ -936,6 +924,7 @@ static int sh_mobile_i2c_probe(struct platform_device *dev)
 
 	adap->owner = THIS_MODULE;
 	adap->algo = &sh_mobile_i2c_algorithm;
+	adap->quirks = &sh_mobile_i2c_quirks;
 	adap->dev.parent = &dev->dev;
 	adap->retries = 5;
 	adap->nr = dev->id;

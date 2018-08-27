@@ -10,11 +10,14 @@
 #include <linux/slab.h>
 #include "sgx.h"
 
+static inline struct sgx_encl_page *to_encl_page(struct sgx_epc_page *epc_page)
+{
+	return container_of(epc_page->impl, struct sgx_encl_page, impl);
+}
+
 static bool sgx_encl_page_get(struct sgx_epc_page *epc_page)
 {
-	struct sgx_encl_page *encl_page = container_of(epc_page->impl,
-						       struct sgx_encl_page,
-						       impl);
+	struct sgx_encl_page *encl_page = to_encl_page(epc_page);
 	struct sgx_encl *encl = encl_page->encl;
 
 	return kref_get_unless_zero(&encl->refcount) != 0;
@@ -22,9 +25,7 @@ static bool sgx_encl_page_get(struct sgx_epc_page *epc_page)
 
 static void sgx_encl_page_put(struct sgx_epc_page *epc_page)
 {
-	struct sgx_encl_page *encl_page = container_of(epc_page->impl,
-						       struct sgx_encl_page,
-						       impl);
+	struct sgx_encl_page *encl_page = to_encl_page(epc_page);
 	struct sgx_encl *encl = encl_page->encl;
 
 	kref_put(&encl->refcount, sgx_encl_release);
@@ -32,30 +33,37 @@ static void sgx_encl_page_put(struct sgx_epc_page *epc_page)
 
 static bool sgx_encl_page_reclaim(struct sgx_epc_page *epc_page)
 {
-	struct sgx_encl_page *encl_page = container_of(epc_page->impl,
-						       struct sgx_encl_page,
-						       impl);
+	struct sgx_encl_page *encl_page = to_encl_page(epc_page);
 	struct sgx_encl *encl = encl_page->encl;
-	bool ret = false;
+	bool ret;
 
 	down_read(&encl->mm->mmap_sem);
 	mutex_lock(&encl->lock);
-	if ((encl->flags & SGX_ENCL_DEAD) ||
-	    (!sgx_test_and_clear_young(encl_page) &&
-	     !(encl_page->desc & SGX_ENCL_PAGE_RESERVED))) {
-		encl_page->desc |= SGX_ENCL_PAGE_RESERVED;
+	/*
+	 * There's a small window between the EPC manager pulling the
+	 * page off the active list and calling reclaim(), during which
+	 * we can free the page, e.g. via sgx_invalidate().  Check the
+	 * LOADED flag to ensure the page is still resident in the EPC.
+	 */
+	if (!(encl_page->desc & SGX_ENCL_PAGE_LOADED))
+		ret = false;
+	else if (encl->flags & SGX_ENCL_DEAD)
 		ret = true;
-	}
+	else if (encl_page->desc & SGX_ENCL_PAGE_RESERVED)
+		ret = false;
+	else
+		ret = !sgx_test_and_clear_young(encl_page);
+	if (ret)
+		encl_page->desc |= SGX_ENCL_PAGE_RECLAIMED;
 	mutex_unlock(&encl->lock);
 	up_read(&encl->mm->mmap_sem);
+
 	return ret;
 }
 
 static void sgx_encl_page_block(struct sgx_epc_page *epc_page)
 {
-	struct sgx_encl_page *encl_page = container_of(epc_page->impl,
-						       struct sgx_encl_page,
-						       impl);
+	struct sgx_encl_page *encl_page = to_encl_page(epc_page);
 	struct sgx_encl *encl = encl_page->encl;
 
 	down_read(&encl->mm->mmap_sem);
@@ -68,15 +76,12 @@ static void sgx_encl_page_block(struct sgx_epc_page *epc_page)
 static int sgx_ewb(struct sgx_encl *encl, struct sgx_epc_page *epc_page,
 		   struct sgx_va_page *va_page, unsigned int va_offset)
 {
-	struct sgx_encl_page *encl_page = container_of(epc_page->impl,
-						       struct sgx_encl_page,
-						       impl);
+	struct sgx_encl_page *encl_page = to_encl_page(epc_page);
 	unsigned long pcmd_offset = SGX_ENCL_PAGE_PCMD_OFFSET(encl_page, encl);
 	struct sgx_pageinfo pginfo;
 	pgoff_t backing_index;
 	struct page *backing;
 	struct page *pcmd;
-	void *epc;
 	void *va;
 	int ret;
 
@@ -95,19 +100,16 @@ static int sgx_ewb(struct sgx_encl *encl, struct sgx_epc_page *epc_page,
 		return ret;
 	}
 
-	epc = sgx_get_page(epc_page);
-	va = sgx_get_page(va_page->epc_page);
+	va = sgx_epc_addr(va_page->epc_page) + va_offset;
 
 	pginfo.addr = 0;
 	pginfo.contents = (unsigned long)kmap_atomic(backing);
 	pginfo.metadata = (unsigned long)kmap_atomic(pcmd) + pcmd_offset;
 	pginfo.secs = 0;
-	ret = __ewb(&pginfo, epc, (void *)((unsigned long)va + va_offset));
+	ret = __ewb(&pginfo, sgx_epc_addr(epc_page), va);
 	kunmap_atomic((void *)(unsigned long)(pginfo.metadata - pcmd_offset));
 	kunmap_atomic((void *)(unsigned long)pginfo.contents);
 
-	sgx_put_page(va);
-	sgx_put_page(epc);
 	sgx_put_backing(pcmd, true);
 	sgx_put_backing(backing, true);
 
@@ -126,13 +128,13 @@ static int sgx_ewb(struct sgx_encl *encl, struct sgx_epc_page *epc_page,
  */
 static void sgx_write_page(struct sgx_epc_page *epc_page, bool do_free)
 {
-	struct sgx_encl_page *encl_page = container_of(epc_page->impl,
-						       struct sgx_encl_page,
-						       impl);
+	struct sgx_encl_page *encl_page = to_encl_page(epc_page);
 	struct sgx_encl *encl = encl_page->encl;
 	struct sgx_va_page *va_page;
 	unsigned int va_offset;
 	int ret;
+
+	encl_page->desc &= ~(SGX_ENCL_PAGE_LOADED | SGX_ENCL_PAGE_RECLAIMED);
 
 	if (!(encl->flags & SGX_ENCL_DEAD)) {
 		va_page = list_first_entry(&encl->va_pages, struct sgx_va_page,
@@ -154,20 +156,22 @@ static void sgx_write_page(struct sgx_epc_page *epc_page, bool do_free)
 		}
 		SGX_INVD(ret, encl, "EWB returned %d\n", ret);
 
+		SGX_INVD(encl_page->desc & SGX_ENCL_PAGE_VA_OFFSET_MASK, encl,
+			"Flags set in VA offset area: %lx", encl_page->desc);
 		encl_page->desc |= va_offset;
 		encl_page->va_page = va_page;
-		encl_page->desc &= ~SGX_ENCL_PAGE_RESERVED;
+	} else if (!do_free) {
+		ret = __eremove(sgx_epc_addr(epc_page));
+		WARN(ret, "EREMOVE returned %d\n", ret);
 	}
-	encl_page->desc &= ~SGX_ENCL_PAGE_LOADED;
+
 	if (do_free)
 		sgx_free_page(epc_page);
 }
 
 static void sgx_encl_page_write(struct sgx_epc_page *epc_page)
 {
-	struct sgx_encl_page *encl_page = container_of(epc_page->impl,
-						       struct sgx_encl_page,
-						       impl);
+	struct sgx_encl_page *encl_page = to_encl_page(epc_page);
 	struct sgx_encl *encl = encl_page->encl;
 
 	down_read(&encl->mm->mmap_sem);
@@ -189,7 +193,7 @@ const struct sgx_epc_page_ops sgx_encl_page_ops = {
 };
 
 /**
- * sgx_set_page_reclaimable - associated an EPC page with an enclave page
+ * sgx_set_epc_page - associate an EPC page with an enclave page
  * @encl_page:	an enclave page
  * @epc_page:	the EPC page to attach to @encl_page
  */
@@ -208,9 +212,7 @@ void sgx_set_page_reclaimable(struct sgx_encl_page *encl_page)
 {
 	sgx_test_and_clear_young(encl_page);
 
-	spin_lock(&sgx_active_page_list_lock);
-	list_add_tail(&encl_page->epc_page->list, &sgx_active_page_list);
-	spin_unlock(&sgx_active_page_list_lock);
+	sgx_page_reclaimable(encl_page->epc_page);
 }
 
 /**
@@ -232,7 +234,7 @@ struct sgx_epc_page *sgx_alloc_va_page(unsigned int flags)
 	if (IS_ERR(epc_page))
 		return (void *)epc_page;
 
-	ret = sgx_epa(epc_page);
+	ret = __epa(sgx_epc_addr(epc_page));
 	if (ret) {
 		pr_crit("EPA failed\n");
 		sgx_free_page(epc_page);

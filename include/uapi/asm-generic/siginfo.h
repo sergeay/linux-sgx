@@ -225,7 +225,11 @@ typedef struct siginfo {
 #else
 # define SEGV_PKUERR	4	/* failed protection key checks */
 #endif
+#ifdef __x86_64__
+#define SEGV_SGXERR	5	/* SGX Enclave Page Cache Map fault */
+#else
 #define SEGV_ACCADI	5	/* ADI not enabled for mapped object */
+#endif
 #define SEGV_ADIDERR	6	/* Disrupting MCD error */
 #define SEGV_ADIPERR	7	/* Precise MCD exception */
 #define NSIGSEGV	7
@@ -249,7 +253,8 @@ typedef struct siginfo {
 #define TRAP_TRACE	2	/* process trace trap */
 #define TRAP_BRANCH     3	/* process taken branch trap */
 #define TRAP_HWBKPT     4	/* hardware breakpoint/watchpoint */
-#define NSIGTRAP	4
+#define TRAP_UNK	5	/* undiagnosed trap */
+#define NSIGTRAP	5
 
 /*
  * There is an additional set of SIGTRAP si_codes used by ptrace

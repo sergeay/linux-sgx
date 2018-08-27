@@ -1151,8 +1151,8 @@ static void eprom_get_byte(struct zatm_dev *zatm_dev, unsigned char *byte,
 }
 
 
-static unsigned char eprom_try_esi(struct atm_dev *dev, unsigned short cmd,
-				   int offset, int swap)
+static int eprom_try_esi(struct atm_dev *dev, unsigned short cmd, int offset,
+			 int swap)
 {
 	unsigned char buf[ZEPROM_SIZE];
 	struct zatm_dev *zatm_dev;
@@ -1385,14 +1385,12 @@ static void zatm_close(struct atm_vcc *vcc)
 
 static int zatm_open(struct atm_vcc *vcc)
 {
-	struct zatm_dev *zatm_dev;
 	struct zatm_vcc *zatm_vcc;
 	short vpi = vcc->vpi;
 	int vci = vcc->vci;
 	int error;
 
 	DPRINTK(">zatm_open\n");
-	zatm_dev = ZATM_DEV(vcc->dev);
 	if (!test_bit(ATM_VF_PARTIAL,&vcc->flags))
 		vcc->dev_data = NULL;
 	if (vci != ATM_VPI_UNSPEC && vpi != ATM_VCI_UNSPEC)
@@ -1483,6 +1481,8 @@ static int zatm_ioctl(struct atm_dev *dev,unsigned int cmd,void __user *arg)
 					return -EFAULT;
 				if (pool < 0 || pool > ZATM_LAST_POOL)
 					return -EINVAL;
+				pool = array_index_nospec(pool,
+							  ZATM_LAST_POOL + 1);
 				if (copy_from_user(&info,
 				    &((struct zatm_pool_req __user *) arg)->info,
 				    sizeof(info))) return -EFAULT;

@@ -431,74 +431,20 @@ int __mnt_want_write_file(struct file *file)
 }
 
 /**
- * mnt_want_write_file_path - get write access to a file's mount
- * @file: the file who's mount on which to take a write
- *
- * This is like mnt_want_write, but it takes a file and can
- * do some optimisations if the file is open for write already
- *
- * Called by the vfs for cases when we have an open file at hand, but will do an
- * inode operation on it (important distinction for files opened on overlayfs,
- * since the file operations will come from the real underlying file, while
- * inode operations come from the overlay).
- */
-int mnt_want_write_file_path(struct file *file)
-{
-	int ret;
-
-	sb_start_write(file->f_path.mnt->mnt_sb);
-	ret = __mnt_want_write_file(file);
-	if (ret)
-		sb_end_write(file->f_path.mnt->mnt_sb);
-	return ret;
-}
-
-static inline int may_write_real(struct file *file)
-{
-	struct dentry *dentry = file->f_path.dentry;
-	struct dentry *upperdentry;
-
-	/* Writable file? */
-	if (file->f_mode & FMODE_WRITER)
-		return 0;
-
-	/* Not overlayfs? */
-	if (likely(!(dentry->d_flags & DCACHE_OP_REAL)))
-		return 0;
-
-	/* File refers to upper, writable layer? */
-	upperdentry = d_real(dentry, NULL, 0, D_REAL_UPPER);
-	if (upperdentry &&
-	    (file_inode(file) == d_inode(upperdentry) ||
-	     file_inode(file) == d_inode(dentry)))
-		return 0;
-
-	/* Lower layer: can't write to real file, sorry... */
-	return -EPERM;
-}
-
-/**
  * mnt_want_write_file - get write access to a file's mount
  * @file: the file who's mount on which to take a write
  *
  * This is like mnt_want_write, but it takes a file and can
  * do some optimisations if the file is open for write already
- *
- * Mostly called by filesystems from their ioctl operation before performing
- * modification.  On overlayfs this needs to check if the file is on a read-only
- * lower layer and deny access in that case.
  */
 int mnt_want_write_file(struct file *file)
 {
 	int ret;
 
-	ret = may_write_real(file);
-	if (!ret) {
-		sb_start_write(file_inode(file)->i_sb);
-		ret = __mnt_want_write_file(file);
-		if (ret)
-			sb_end_write(file_inode(file)->i_sb);
-	}
+	sb_start_write(file_inode(file)->i_sb);
+	ret = __mnt_want_write_file(file);
+	if (ret)
+		sb_end_write(file_inode(file)->i_sb);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(mnt_want_write_file);
@@ -538,14 +484,9 @@ void __mnt_drop_write_file(struct file *file)
 	__mnt_drop_write(file->f_path.mnt);
 }
 
-void mnt_drop_write_file_path(struct file *file)
-{
-	mnt_drop_write(file->f_path.mnt);
-}
-
 void mnt_drop_write_file(struct file *file)
 {
-	__mnt_drop_write(file->f_path.mnt);
+	__mnt_drop_write_file(file);
 	sb_end_write(file_inode(file)->i_sb);
 }
 EXPORT_SYMBOL(mnt_drop_write_file);
@@ -659,12 +600,21 @@ int __legitimize_mnt(struct vfsmount *bastard, unsigned seq)
 		return 0;
 	mnt = real_mount(bastard);
 	mnt_add_count(mnt, 1);
+	smp_mb();			// see mntput_no_expire()
 	if (likely(!read_seqretry(&mount_lock, seq)))
 		return 0;
 	if (bastard->mnt_flags & MNT_SYNC_UMOUNT) {
 		mnt_add_count(mnt, -1);
 		return 1;
 	}
+	lock_mount_hash();
+	if (unlikely(bastard->mnt_flags & MNT_DOOMED)) {
+		mnt_add_count(mnt, -1);
+		unlock_mount_hash();
+		return 1;
+	}
+	unlock_mount_hash();
+	/* caller will mntput() */
 	return -1;
 }
 
@@ -1195,12 +1145,27 @@ static DECLARE_DELAYED_WORK(delayed_mntput_work, delayed_mntput);
 static void mntput_no_expire(struct mount *mnt)
 {
 	rcu_read_lock();
-	mnt_add_count(mnt, -1);
-	if (likely(mnt->mnt_ns)) { /* shouldn't be the last one */
+	if (likely(READ_ONCE(mnt->mnt_ns))) {
+		/*
+		 * Since we don't do lock_mount_hash() here,
+		 * ->mnt_ns can change under us.  However, if it's
+		 * non-NULL, then there's a reference that won't
+		 * be dropped until after an RCU delay done after
+		 * turning ->mnt_ns NULL.  So if we observe it
+		 * non-NULL under rcu_read_lock(), the reference
+		 * we are dropping is not the final one.
+		 */
+		mnt_add_count(mnt, -1);
 		rcu_read_unlock();
 		return;
 	}
 	lock_mount_hash();
+	/*
+	 * make sure that if __legitimize_mnt() has not seen us grab
+	 * mount_lock, we'll see their refcount increment here.
+	 */
+	smp_mb();
+	mnt_add_count(mnt, -1);
 	if (mnt_get_count(mnt)) {
 		rcu_read_unlock();
 		unlock_mount_hash();
@@ -1590,7 +1555,7 @@ static int do_umount(struct mount *mnt, int flags)
 		 * Special case for "unmounting" root ...
 		 * we just try to remount it readonly.
 		 */
-		if (!capable(CAP_SYS_ADMIN))
+		if (!ns_capable(sb->s_user_ns, CAP_SYS_ADMIN))
 			return -EPERM;
 		down_write(&sb->s_umount);
 		if (!sb_rdonly(sb))
@@ -2333,7 +2298,7 @@ static int do_remount(struct path *path, int ms_flags, int sb_flags,
 	down_write(&sb->s_umount);
 	if (ms_flags & MS_BIND)
 		err = change_mount_flags(path->mnt, ms_flags);
-	else if (!capable(CAP_SYS_ADMIN))
+	else if (!ns_capable(sb->s_user_ns, CAP_SYS_ADMIN))
 		err = -EPERM;
 	else
 		err = do_remount_sb(sb, sb_flags, data, 0);

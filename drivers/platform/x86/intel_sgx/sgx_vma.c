@@ -55,21 +55,18 @@ static int sgx_edbgrd(struct sgx_encl *encl, struct sgx_encl_page *page,
 		      unsigned long addr, void *data)
 {
 	unsigned long offset;
-	void *ptr;
 	int ret;
 
 	offset = addr & ~PAGE_MASK;
 
 	if ((page->desc & SGX_ENCL_PAGE_TCS) &&
-            offset > offsetof(struct sgx_tcs, gs_limit))
+	    offset > offsetof(struct sgx_tcs, gs_limit))
 		return -ECANCELED;
 
-	ptr = sgx_get_page(page->epc_page);
-	ret = __edbgrd((unsigned long)ptr + offset, data);
-	sgx_put_page(ptr);
+	ret = __edbgrd(sgx_epc_addr(page->epc_page) + offset, data);
 	if (ret) {
 		sgx_dbg(encl, "EDBGRD returned %d\n", ret);
-		return ENCLS_TO_ERR(ret);
+		return encls_to_err(ret);
 	}
 
 	return 0;
@@ -79,7 +76,6 @@ static int sgx_edbgwr(struct sgx_encl *encl, struct sgx_encl_page *page,
 		      unsigned long addr, void *data)
 {
 	unsigned long offset;
-	void *ptr;
 	int ret;
 
 	offset = addr & ~PAGE_MASK;
@@ -89,12 +85,10 @@ static int sgx_edbgwr(struct sgx_encl *encl, struct sgx_encl_page *page,
 	    offset != offsetof(struct sgx_tcs, flags))
 		return -ECANCELED;
 
-	ptr = sgx_get_page(page->epc_page);
-	ret = __edbgwr((unsigned long)ptr + offset, data);
-	sgx_put_page(ptr);
+	ret = __edbgwr(sgx_epc_addr(page->epc_page) + offset, data);
 	if (ret) {
 		sgx_dbg(encl, "EDBGWR returned %d\n", ret);
-		return ENCLS_TO_ERR(ret);
+		return encls_to_err(ret);
 	}
 
 	return 0;
@@ -155,15 +149,14 @@ static int sgx_vma_access(struct vm_area_struct *vma, unsigned long addr,
 			ret = sgx_edbgwr(encl, entry, align, data);
 			if (ret)
 				break;
-		}
-		else
-			memcpy(buf + i,data + offset, cnt);
+		} else
+			memcpy(buf + i, data + offset, cnt);
 	}
 
 	if (entry)
 		entry->desc &= ~SGX_ENCL_PAGE_RESERVED;
 
-	return (ret < 0 && ret != -ECANCELED) ? ret : i;
+	return ret < 0 ? ret : i;
 }
 
 const struct vm_operations_struct sgx_vm_ops = {

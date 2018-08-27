@@ -1135,7 +1135,7 @@ static int rk_iommu_probe(struct platform_device *pdev)
 	iommu->dev = dev;
 	iommu->num_mmu = 0;
 
-	iommu->bases = devm_kzalloc(dev, sizeof(*iommu->bases) * num_res,
+	iommu->bases = devm_kcalloc(dev, num_res, sizeof(*iommu->bases),
 				    GFP_KERNEL);
 	if (!iommu->bases)
 		return -ENOMEM;
@@ -1283,8 +1283,6 @@ static int __init rk_iommu_init(void)
 	return platform_driver_register(&rk_iommu_driver);
 }
 subsys_initcall(rk_iommu_init);
-
-IOMMU_OF_DECLARE(rk_iommu_of, "rockchip,iommu");
 
 MODULE_DESCRIPTION("IOMMU API for Rockchip");
 MODULE_AUTHOR("Simon Xue <xxm@rock-chips.com> and Daniel Kurtz <djkurtz@chromium.org>");

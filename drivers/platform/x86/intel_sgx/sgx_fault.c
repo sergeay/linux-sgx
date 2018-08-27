@@ -73,7 +73,7 @@ static struct sgx_epc_page *__sgx_load_faulted_page(
 	}
 	sgx_free_va_slot(encl_page->va_page, va_offset);
 	list_move(&encl_page->va_page->list, &encl->va_pages);
-	encl_page->desc &= ~SGX_VA_OFFSET_MASK;
+	encl_page->desc &= ~SGX_ENCL_PAGE_VA_OFFSET_MASK;
 	sgx_set_epc_page(encl_page, epc_page);
 	return epc_page;
 }
@@ -94,13 +94,19 @@ static struct sgx_encl_page *__sgx_fault_page(struct vm_area_struct *vma,
 	entry = radix_tree_lookup(&encl->page_tree, addr >> PAGE_SHIFT);
 	if (!entry)
 		return ERR_PTR(-EFAULT);
-	if (entry->desc & SGX_ENCL_PAGE_RESERVED) {
-		sgx_dbg(encl, "0x%p is reserved\n",
-			(void *)SGX_ENCL_PAGE_ADDR(entry));
-		return ERR_PTR(-EBUSY);
-	}
-	/* Page was faulted by another thread. */
+
+	/* Page is already resident in the EPC. */
 	if (entry->desc & SGX_ENCL_PAGE_LOADED) {
+		if (entry->desc & SGX_ENCL_PAGE_RESERVED) {
+			sgx_dbg(encl, "EPC page 0x%p is already reserved\n",
+				(void *)SGX_ENCL_PAGE_ADDR(entry));
+			return ERR_PTR(-EBUSY);
+		}
+		if (entry->desc & SGX_ENCL_PAGE_RECLAIMED) {
+			sgx_dbg(encl, "EPC page 0x%p is being reclaimed\n",
+				(void *)SGX_ENCL_PAGE_ADDR(entry));
+			return ERR_PTR(-EBUSY);
+		}
 		if (do_reserve)
 			entry->desc |= SGX_ENCL_PAGE_RESERVED;
 		return entry;
@@ -120,7 +126,7 @@ static struct sgx_encl_page *__sgx_fault_page(struct vm_area_struct *vma,
 	if (do_reserve)
 		entry->desc |= SGX_ENCL_PAGE_RESERVED;
 
-	rc = vm_insert_pfn(vma, addr, SGX_EPC_PFN(entry->epc_page));
+	rc = vm_insert_pfn(vma, addr, PFN_DOWN(entry->epc_page->desc));
 	SGX_INVD(rc, encl, "%s: vm_insert_pfn() returned %d\n", __func__, rc);
 	if (rc)
 		return ERR_PTR(rc);
