@@ -146,10 +146,10 @@ static int sgx_eadd(struct sgx_epc_page *secs_page,
 	return ret;
 }
 
-static bool sgx_process_add_page_req(struct sgx_add_page_req *req,
-				     struct sgx_epc_page *epc_page)
+static bool sgx_process_add_page_req(struct sgx_add_page_req *req)
 {
 	struct sgx_encl_page *encl_page = req->encl_page;
+	struct sgx_epc_page *epc_page = encl_page->epc_page;
 	struct sgx_encl *encl = req->encl;
 	struct sgx_secinfo secinfo;
 	struct vm_area_struct *vma;
@@ -216,7 +216,6 @@ static void sgx_add_page_worker(struct work_struct *work)
 	bool skip_rest = false;
 	bool is_empty = false;
 	struct sgx_encl *encl;
-	struct sgx_epc_page *epc_page;
 
 	encl = container_of(work, struct sgx_encl, add_page_work);
 
@@ -236,15 +235,12 @@ static void sgx_add_page_worker(struct work_struct *work)
 		if (skip_rest)
 			goto next;
 
-		epc_page = sgx_alloc_page(&req->encl_page->impl, 0);
 		down_read(&encl->mm->mmap_sem);
 		mutex_lock(&encl->lock);
 
-		if (IS_ERR(epc_page)) {
-			sgx_invalidate(encl, false);
-			skip_rest = true;
-		} else	if (!sgx_process_add_page_req(req, epc_page)) {
-			sgx_free_page(epc_page);
+		if (!sgx_process_add_page_req(req)) {
+			sgx_free_page(req->encl_page->epc_page);
+			req->encl_page->epc_page = NULL;
 			sgx_invalidate(encl, false);
 			skip_rest = true;
 		}
@@ -366,7 +362,7 @@ static int sgx_encl_grow(struct sgx_encl *encl)
 		va_page = kzalloc(sizeof(*va_page), GFP_KERNEL);
 		if (!va_page)
 			return -ENOMEM;
-		va_page->epc_page = sgx_alloc_va_page(0);
+		va_page->epc_page = sgx_alloc_va_page(encl);
 		if (IS_ERR(va_page->epc_page)) {
 			ret = PTR_ERR(va_page->epc_page);
 			kfree(va_page);
@@ -486,7 +482,7 @@ int sgx_encl_create(struct sgx_encl *encl, struct sgx_secs *secs)
 	struct sgx_epc_page *secs_epc;
 	long ret;
 
-	secs_epc = sgx_alloc_page(&encl->secs.impl, 0);
+	secs_epc = sgx_alloc_page_mm(&encl->secs.impl, secs->base, current->mm);
 	if (IS_ERR(secs_epc)) {
 		ret = PTR_ERR(secs_epc);
 		return ret;
@@ -725,6 +721,7 @@ int sgx_encl_add_page(struct sgx_encl *encl, unsigned long addr, void *data,
 {
 	u64 page_type = secinfo->flags & SGX_SECINFO_PAGE_TYPE_MASK;
 	struct sgx_encl_page *encl_page;
+	struct sgx_epc_page *epc_page;
 	int ret;
 
 	if (sgx_validate_secinfo(secinfo))
@@ -747,9 +744,21 @@ int sgx_encl_add_page(struct sgx_encl *encl, unsigned long addr, void *data,
 		mutex_unlock(&encl->lock);
 		return PTR_ERR(encl_page);
 	}
-	ret = __sgx_encl_add_page(encl, encl_page, data, secinfo, mrmask);
-	if (ret)
+	mutex_unlock(&encl->lock);
+	epc_page = sgx_alloc_page_mm(&encl_page->impl,
+				SGX_ENCL_PAGE_ADDR(encl_page), encl->mm);
+	if (IS_ERR(epc_page)) {
 		sgx_encl_free_page(encl_page);
+		sgx_invalidate(encl, false);
+		return PTR_ERR(epc_page);
+	}
+	encl_page->epc_page = epc_page;
+	mutex_lock(&encl->lock);
+	ret = __sgx_encl_add_page(encl, encl_page, data, secinfo, mrmask);
+	if (ret) {
+		sgx_free_page(epc_page);
+		sgx_encl_free_page(encl_page);
+	}
 	mutex_unlock(&encl->lock);
 	return ret;
 }

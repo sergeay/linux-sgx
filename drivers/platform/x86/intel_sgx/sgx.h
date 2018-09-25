@@ -206,9 +206,21 @@ extern const struct sgx_epc_page_ops sgx_encl_page_ops;
 void sgx_set_epc_page(struct sgx_encl_page *encl_page,
 		      struct sgx_epc_page *epc_page);
 void sgx_set_page_reclaimable(struct sgx_encl_page *encl_page);
-struct sgx_epc_page *sgx_alloc_va_page(unsigned int flags);
+struct sgx_epc_page *sgx_alloc_va_page(struct sgx_encl *encl);
 unsigned int sgx_alloc_va_slot(struct sgx_va_page *va_page);
 void sgx_free_va_slot(struct sgx_va_page *va_page, unsigned int offset);
 bool sgx_va_page_full(struct sgx_va_page *va_page);
+#ifdef CONFIG_NUMA
+	struct sgx_epc_page *sgx_alloc_page_vma(
+		struct sgx_epc_page_impl *impl,	unsigned int flags,
+		unsigned long addr, struct vm_area_struct *vma);
+	struct sgx_epc_page *sgx_alloc_page_mm(struct sgx_epc_page_impl *impl,
+				unsigned long addr, struct mm_struct *mm);
+#else
+	#define sgx_alloc_page_vma(_impl, _fl, _addr, _vma) \
+				sgx_alloc_page(_impl, _fl, 0)
+	#define sgx_alloc_page_mm(_impl, _addr, _mm) \
+				sgx_alloc_page(_impl, 0, 0)
+#endif
 
 #endif /* __ARCH_X86_INTEL_SGX_H__ */

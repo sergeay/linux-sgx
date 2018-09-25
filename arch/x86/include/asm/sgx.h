@@ -8,6 +8,7 @@
 #include <linux/err.h>
 #include <linux/rwsem.h>
 #include <linux/types.h>
+#include <linux/wait.h>
 #include <asm/sgx_arch.h>
 #include <asm/asm.h>
 
@@ -50,15 +51,35 @@ struct sgx_epc_bank {
 	unsigned long pa;
 	void *va;
 	unsigned long size;
+};
+
+struct sgx_epc_node {
+	struct sgx_epc_bank *bank;
 	struct sgx_epc_page *pages_data;
 	struct sgx_epc_page **pages;
 	unsigned long free_cnt;
 	spinlock_t lock;
+	struct list_head active_page_list;
+	spinlock_t active_page_list_lock;
+	struct task_struct *kswapd_tsk;
+	struct wait_queue_head kswapd_waitq;
+	int *near_list;
 };
+
+#ifdef CONFIG_NUMA
+	#define MAX_SGX_NUMNODES MAX_NUMNODES
+	#define SGX_NODE_DATA(_n) (&sgx_nodes[_n])
+#else
+	#define MAX_SGX_NUMNODES 1
+	#define SGX_NODE_DATA(_n) (&sgx_nodes[0])
+#endif
+
+#define NODE_HAS_SGX(_n) (SGX_NODE_DATA(_n)->bank)
 
 extern bool sgx_enabled;
 extern bool sgx_lc_enabled;
-extern struct sgx_epc_bank sgx_epc_banks[SGX_MAX_EPC_BANKS];
+extern struct sgx_epc_node sgx_nodes[];
+// TBD extern struct sgx_epc_bank sgx_epc_banks[SGX_MAX_EPC_BANKS];
 
 enum sgx_alloc_flags {
 	SGX_ALLOC_ATOMIC	= BIT(0),
@@ -66,15 +87,18 @@ enum sgx_alloc_flags {
 
 /*
  * enum sgx_epc_page_desc - defines bits and masks for an EPC page's desc
- * @SGX_EPC_BANK_MASK:	      SGX allows a system to multiple EPC banks (at
- *			      different physical locations).  The index of a
- *			      page's bank in its desc so that we can do a quick
- *			      lookup of its virtual address (EPC is mapped via
- *			      ioremap_cache() because it's non-standard memory).
- *			      Current and near-future hardware defines at most
- *			      eight banks, hence three bits to hold the bank.
- *			      sgx_page_cache_init() asserts that the max bank
- *			      index doesn't exceed SGX_EPC_BANK_MASK.
+ * @SGX_EPC_NODE_MASK:	SGX allows a system to have multiple EPC banks (at
+ *			different physical locations) and at most one
+ *			bank per node.
+ *			The index of a page's node in its desc so that
+ *			we can do a quick lookup of its virtual address
+ *			(EPC is mapped via
+ *			ioremap_cache() because it's non-standard memory).
+ *			Current and near-future hardware defines at most 1024
+ *			nodes hence ten bits to hold the node index.
+ *			sgx_page_cache_init() asserts that the max node
+ *			index doesn't exceed SGX_EPC_NODE_MASK.
+ *
  * @SGX_EPC_PAGE_RECLAIMABLE: When set, indicates a page is reclaimable.  Used
  *			      when freeing a page to know that we also need to
  *			      remove the page from the active page list.
@@ -84,25 +108,26 @@ enum sgx_alloc_flags {
  * flag.
  */
 enum sgx_epc_page_desc {
-	SGX_EPC_BANK_MASK			= GENMASK_ULL(3, 0),
-	SGX_EPC_PAGE_RECLAIMABLE		= BIT(4),
+	SGX_EPC_NODE_MASK			= GENMASK_ULL(9, 0),
+	SGX_EPC_PAGE_RECLAIMABLE	= BIT(10),
 	/* bits 12-63 are reserved for the physical page address of the page */
 };
 
-static inline struct sgx_epc_bank *sgx_epc_bank(struct sgx_epc_page *page)
+static inline struct sgx_epc_node *sgx_epc_node(struct sgx_epc_page *page)
 {
-	return &sgx_epc_banks[page->desc & SGX_EPC_BANK_MASK];
+	return SGX_NODE_DATA(page->desc & SGX_EPC_NODE_MASK);
 }
 
 static inline void *sgx_epc_addr(struct sgx_epc_page *page)
 {
-	struct sgx_epc_bank *bank = sgx_epc_bank(page);
+	struct sgx_epc_node *node = sgx_epc_node(page);
 
-	return (void *)(bank->va + (page->desc & PAGE_MASK) - bank->pa);
+	return (void *)(node->bank->va +
+			(page->desc & PAGE_MASK) - node->bank->pa);
 }
 
 struct sgx_epc_page *sgx_alloc_page(struct sgx_epc_page_impl *impl,
-				    unsigned int flags);
+				    unsigned int flags, int nid);
 int __sgx_free_page(struct sgx_epc_page *page);
 void sgx_free_page(struct sgx_epc_page *page);
 void sgx_page_reclaimable(struct sgx_epc_page *page);
@@ -356,6 +381,35 @@ static inline int __emodpr(struct sgx_secinfo *secinfo, void *epc)
 static inline int __emodt(struct sgx_secinfo *secinfo, void *epc)
 {
 	return __encls_ret_2(EMODT, secinfo, epc);
+}
+
+static inline bool is_active_list_empty(struct sgx_epc_node *node)
+{
+	return list_empty(&node->active_page_list);
+}
+
+static inline struct sgx_epc_page *get_active_list_first(struct sgx_epc_node *
+node)
+{
+	return list_first_entry(&node->active_page_list,
+					    struct sgx_epc_page, list);
+}
+
+static inline void move_to_active_list_end(struct sgx_epc_page *epc_page,
+						struct sgx_epc_node *node)
+{
+	list_move_tail(&epc_page->list, &node->active_page_list);
+}
+
+static inline void remove_from_active_list(struct sgx_epc_page *epc_page)
+{
+	list_del(&epc_page->list);
+}
+
+static inline void return_to_active_list_tail(struct sgx_epc_page *epc_page,
+						struct sgx_epc_node *node)
+{
+	list_add_tail(&epc_page->list, &node->active_page_list);
 }
 
 #endif /* _ASM_X86_SGX_H */

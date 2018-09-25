@@ -4,12 +4,15 @@
 #include <linux/freezer.h>
 #include <linux/highmem.h>
 #include <linux/kthread.h>
+#include <linux/nodemask.h>
+#include <linux/numa.h>
 #include <linux/pagemap.h>
 #include <linux/ratelimit.h>
 #include <linux/sched/signal.h>
 #include <linux/shmem_fs.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
+#include <linux/wait.h>
 #include <asm/sgx.h>
 #include <asm/sgx_pr.h>
 
@@ -32,13 +35,10 @@ EXPORT_SYMBOL_GPL(sgx_enabled);
 bool sgx_lc_enabled __ro_after_init;
 EXPORT_SYMBOL_GPL(sgx_lc_enabled);
 struct sgx_epc_bank sgx_epc_banks[SGX_MAX_EPC_BANKS];
-EXPORT_SYMBOL_GPL(sgx_epc_banks);
+struct sgx_epc_node sgx_nodes[MAX_SGX_NUMNODES];
+EXPORT_SYMBOL_GPL(sgx_nodes);
 
 static int sgx_nr_epc_banks;
-static LIST_HEAD(sgx_active_page_list);
-static DEFINE_SPINLOCK(sgx_active_page_list_lock);
-static struct task_struct *ksgxswapd_tsk;
-static DECLARE_WAIT_QUEUE_HEAD(ksgxswapd_waitq);
 static struct notifier_block sgx_pm_notifier;
 static u64 sgx_pm_cnt;
 
@@ -59,37 +59,35 @@ static DEFINE_PER_CPU(struct sgx_lepubkeyhash *, sgx_lepubkeyhash_cache);
  * tries to swap them. Only the pages that are either being freed by the
  * consumer or actively used are skipped.
  */
-static void sgx_reclaim_pages(void)
+static void sgx_reclaim_pages(struct sgx_epc_node *node)
 {
 	struct sgx_epc_page *chunk[SGX_NR_TO_SCAN + 1];
 	struct sgx_epc_page *epc_page;
-	struct sgx_epc_bank *bank;
 	int i, j;
 
-	spin_lock(&sgx_active_page_list_lock);
+	spin_lock(&node->active_page_list_lock);
 	for (i = 0, j = 0; i < SGX_NR_TO_SCAN; i++) {
-		if (list_empty(&sgx_active_page_list))
+		if (is_active_list_empty(node))
 			break;
 
-		epc_page = list_first_entry(&sgx_active_page_list,
-					    struct sgx_epc_page, list);
-		list_del_init(&epc_page->list);
+		epc_page = get_active_list_first(node);
+		remove_from_active_list(epc_page);
 
 		if (epc_page->impl->ops->get(epc_page))
 			chunk[j++] = epc_page;
 		else
 			epc_page->desc &= ~SGX_EPC_PAGE_RECLAIMABLE;
 	}
-	spin_unlock(&sgx_active_page_list_lock);
+	spin_unlock(&node->active_page_list_lock);
 
 	for (i = 0; i < j; i++) {
 		epc_page = chunk[i];
 		if (epc_page->impl->ops->reclaim(epc_page))
 			continue;
 
-		spin_lock(&sgx_active_page_list_lock);
-		list_add_tail(&epc_page->list, &sgx_active_page_list);
-		spin_unlock(&sgx_active_page_list_lock);
+		spin_lock(&node->active_page_list_lock);
+		return_to_active_list_tail(epc_page, node);
+		spin_unlock(&node->active_page_list_lock);
 
 		epc_page->impl->ops->put(epc_page);
 		chunk[i] = NULL;
@@ -115,47 +113,34 @@ static void sgx_reclaim_pages(void)
 			 */
 			epc_page->desc &= ~SGX_EPC_PAGE_RECLAIMABLE;
 
-			bank = sgx_epc_bank(epc_page);
-			spin_lock(&bank->lock);
-			bank->pages[bank->free_cnt++] = epc_page;
-			spin_unlock(&bank->lock);
+			spin_lock(&node->lock);
+			node->pages[node->free_cnt++] = epc_page;
+			spin_unlock(&node->lock);
 		}
 	}
 }
 
-static unsigned long sgx_calc_free_cnt(void)
+static inline bool sgx_should_reclaim(struct sgx_epc_node *node)
 {
-	struct sgx_epc_bank *bank;
-	unsigned long free_cnt = 0;
-	int i;
-
-	for (i = 0; i < sgx_nr_epc_banks; i++) {
-		bank = &sgx_epc_banks[i];
-		free_cnt += bank->free_cnt;
-	}
-
-	return free_cnt;
-}
-
-static inline bool sgx_should_reclaim(void)
-{
-	return sgx_calc_free_cnt() < SGX_NR_HIGH_PAGES &&
-	       !list_empty(&sgx_active_page_list);
+	return node->free_cnt < SGX_NR_HIGH_PAGES &&
+	       !is_active_list_empty(node);
 }
 
 static int ksgxswapd(void *p)
 {
+	struct sgx_epc_node *node = (struct sgx_epc_node *)p;
+
 	set_freezable();
 
 	while (!kthread_should_stop()) {
 		if (try_to_freeze())
 			continue;
 
-		wait_event_freezable(ksgxswapd_waitq, kthread_should_stop() ||
-						      sgx_should_reclaim());
+		wait_event_freezable(node->kswapd_waitq,
+			kthread_should_stop() || sgx_should_reclaim(node));
 
-		if (sgx_should_reclaim())
-			sgx_reclaim_pages();
+		if (sgx_should_reclaim(node))
+			sgx_reclaim_pages(node);
 
 		cond_resched();
 	}
@@ -163,25 +148,24 @@ static int ksgxswapd(void *p)
 	return 0;
 }
 
-static struct sgx_epc_page *sgx_try_alloc_page(struct sgx_epc_page_impl *impl)
+static struct sgx_epc_page *sgx_try_alloc_page(struct sgx_epc_page_impl *impl,
+						struct sgx_epc_node *node)
 {
-	struct sgx_epc_bank *bank;
-	struct sgx_epc_page *page;
-	int i;
+	struct sgx_epc_page *page = NULL;
 
-	for (i = 0; i < sgx_nr_epc_banks; i++) {
-		bank = &sgx_epc_banks[i];
-		spin_lock(&bank->lock);
-		if (bank->free_cnt) {
-			page = bank->pages[bank->free_cnt - 1];
-			bank->free_cnt--;
-		}
-		spin_unlock(&bank->lock);
+	if (!node->bank)
+		return NULL;
 
-		if (page) {
-			page->impl = impl;
-			return page;
-		}
+	spin_lock(&node->lock);
+	if (node->free_cnt) {
+		page = node->pages[node->free_cnt - 1];
+		node->free_cnt--;
+	}
+	spin_unlock(&node->lock);
+
+	if (page) {
+		page->impl = impl;
+		return page;
 	}
 
 	return NULL;
@@ -204,16 +188,20 @@ static struct sgx_epc_page *sgx_try_alloc_page(struct sgx_epc_page_impl *impl)
  *   -EBUSY when called with SGX_ALLOC_ATOMIC and out of free pages
  */
 struct sgx_epc_page *sgx_alloc_page(struct sgx_epc_page_impl *impl,
-				    unsigned int flags)
+				    unsigned int flags, int nid)
 {
 	struct sgx_epc_page *entry;
+	struct sgx_epc_node *node = SGX_NODE_DATA(nid);
+
+	if (!node->bank)
+		return ERR_PTR(-ENOMEM);
 
 	for ( ; ; ) {
-		entry = sgx_try_alloc_page(impl);
+		entry = sgx_try_alloc_page(impl, node);
 		if (entry)
 			break;
 
-		if (list_empty(&sgx_active_page_list))
+		if (is_active_list_empty(node))
 			return ERR_PTR(-ENOMEM);
 
 		if (flags & SGX_ALLOC_ATOMIC) {
@@ -226,12 +214,12 @@ struct sgx_epc_page *sgx_alloc_page(struct sgx_epc_page_impl *impl,
 			break;
 		}
 
-		sgx_reclaim_pages();
+		sgx_reclaim_pages(node);
 		schedule();
 	}
 
-	if (sgx_calc_free_cnt() < SGX_NR_LOW_PAGES)
-		wake_up(&ksgxswapd_waitq);
+	if (node->free_cnt < SGX_NR_LOW_PAGES)
+		wake_up(&node->kswapd_waitq);
 
 	return entry;
 }
@@ -251,7 +239,7 @@ EXPORT_SYMBOL_GPL(sgx_alloc_page);
  */
 int __sgx_free_page(struct sgx_epc_page *page)
 {
-	struct sgx_epc_bank *bank = sgx_epc_bank(page);
+	struct sgx_epc_node *node = sgx_epc_node(page);
 	int ret;
 
 	/*
@@ -261,25 +249,25 @@ int __sgx_free_page(struct sgx_epc_page *page)
 	 * the page at this time since it is "owned" by the reclaimer.
 	 */
 	if (page->desc & SGX_EPC_PAGE_RECLAIMABLE) {
-		spin_lock(&sgx_active_page_list_lock);
+		spin_lock(&node->active_page_list_lock);
 		if (page->desc & SGX_EPC_PAGE_RECLAIMABLE) {
 			if (list_empty(&page->list)) {
-				spin_unlock(&sgx_active_page_list_lock);
+				spin_unlock(&node->active_page_list_lock);
 				return -EBUSY;
 			}
 			list_del(&page->list);
 			page->desc &= ~SGX_EPC_PAGE_RECLAIMABLE;
 		}
-		spin_unlock(&sgx_active_page_list_lock);
+		spin_unlock(&node->active_page_list_lock);
 	}
 
 	ret = __eremove(sgx_epc_addr(page));
 	if (ret)
 		return ret;
 
-	spin_lock(&bank->lock);
-	bank->pages[bank->free_cnt++] = page;
-	spin_unlock(&bank->lock);
+	spin_lock(&node->lock);
+	node->pages[node->free_cnt++] = page;
+	spin_unlock(&node->lock);
 
 	return 0;
 }
@@ -315,10 +303,12 @@ EXPORT_SYMBOL_GPL(sgx_free_page);
  */
 void sgx_page_reclaimable(struct sgx_epc_page *page)
 {
-	spin_lock(&sgx_active_page_list_lock);
+	struct sgx_epc_node *node = sgx_epc_node(page);
+
+	spin_lock(&node->active_page_list_lock);
 	page->desc |= SGX_EPC_PAGE_RECLAIMABLE;
-	list_add_tail(&page->list, &sgx_active_page_list);
-	spin_unlock(&sgx_active_page_list_lock);
+	return_to_active_list_tail(page, node);
+	spin_unlock(&node->active_page_list_lock);
 }
 EXPORT_SYMBOL_GPL(sgx_page_reclaimable);
 
@@ -390,61 +380,195 @@ int sgx_einit(struct sgx_sigstruct *sigstruct, struct sgx_einittoken *token,
 EXPORT_SYMBOL(sgx_einit);
 
 static __init int sgx_init_epc_bank(u64 addr, u64 size, unsigned long index,
-				    struct sgx_epc_bank *bank)
+									int nid)
 {
 	unsigned long nr_pages = size >> PAGE_SHIFT;
-	struct sgx_epc_page *pages_data;
-	unsigned long i;
+	struct sgx_epc_bank *bank = sgx_epc_banks + index;
+	struct sgx_epc_node *node = SGX_NODE_DATA(nid);
 	void *va;
 
 	va = ioremap_cache(addr, size);
 	if (!va)
 		return -ENOMEM;
 
-	pages_data = kcalloc(nr_pages, sizeof(struct sgx_epc_page), GFP_KERNEL);
-	if (!pages_data)
-		goto out_iomap;
-
-	bank->pages = kcalloc(nr_pages, sizeof(struct sgx_epc_page *),
-			      GFP_KERNEL);
-	if (!bank->pages)
-		goto out_pdata;
-
-	for (i = 0; i < nr_pages; i++) {
-		bank->pages[i] = &pages_data[i];
-		bank->pages[i]->desc = (addr + (i << PAGE_SHIFT)) | index;
-	}
+	/* there can not be more than one bank per node */
+	WARN_ON(node->bank);
+	node->bank = bank;
+	node->free_cnt = nr_pages;
 
 	bank->pa = addr;
 	bank->size = size;
 	bank->va = va;
-	bank->free_cnt = nr_pages;
-	bank->pages_data = pages_data;
-	spin_lock_init(&bank->lock);
+	spin_lock_init(&node->lock);
 	return 0;
-out_pdata:
-	kfree(pages_data);
-out_iomap:
-	iounmap(va);
-	return -ENOMEM;
 }
 
 static __init void sgx_page_cache_teardown(void)
 {
-	struct sgx_epc_bank *bank;
+	struct sgx_epc_node *node;
 	int i;
 
-	if (ksgxswapd_tsk) {
-		kthread_stop(ksgxswapd_tsk);
-		ksgxswapd_tsk = NULL;
+	for_each_online_node(i) {
+		node = SGX_NODE_DATA(i);
+		kfree(node->near_list);
+		node->near_list = NULL;
+		if (!node->bank)
+			continue;
+		if (node->kswapd_tsk) {
+			kthread_stop(node->kswapd_tsk);
+			node->kswapd_tsk = NULL;
+		}
+		kfree(node->pages);
+		kfree(node->pages_data);
+		node->free_cnt = 0;
+		node->bank = NULL;
 	}
 
-	for (i = 0; i < sgx_nr_epc_banks; i++) {
-		bank = &sgx_epc_banks[i];
-		iounmap((void *)bank->va);
-		kfree(bank->pages);
-		kfree(bank->pages_data);
+	for (i = 0; i < sgx_nr_epc_banks; i++)
+		iounmap((void *)sgx_epc_banks[i].va);
+}
+
+static __init int sgx_init_epc_node(int nid)
+{
+	struct sgx_epc_node *node = SGX_NODE_DATA(nid);
+	struct sgx_epc_bank *bank;
+	unsigned long nr_pages = node->free_cnt;
+	unsigned long addr;
+	struct task_struct *tsk;
+	char *kthname = "ksgxswapd0";
+	int i;
+
+	node->pages_data = kcalloc(nr_pages, sizeof(struct sgx_epc_page),
+				   GFP_KERNEL);
+	if (!node->pages_data)
+		return -ENOMEM;
+
+	spin_lock_init(&node->active_page_list_lock);
+	INIT_LIST_HEAD(&node->active_page_list);
+
+	node->pages = kcalloc(nr_pages, sizeof(struct sgx_epc_page *),
+			      GFP_KERNEL);
+	if (!node->pages) {
+		kfree(node->pages_data);
+		node->pages_data = NULL;
+		return -ENOMEM;
 	}
+
+	bank = node->bank;
+	for (i = 0, addr = bank->pa; i < nr_pages; i++, addr += PAGE_SIZE) {
+		if (addr >= bank->pa + bank->size) {
+			bank++;
+			addr = bank->pa;
+		}
+		node->pages[i] = &node->pages_data[i];
+		node->pages[i]->desc = addr | nid;
+	}
+
+	spin_lock_init(&node->lock);
+	init_waitqueue_head(&node->kswapd_waitq);
+	kthname[9] += nid;
+	tsk = kthread_run(ksgxswapd, (void *)node, kthname);
+	if (IS_ERR(tsk)) {
+		sgx_page_cache_teardown();
+		return PTR_ERR(tsk);
+	}
+	node->kswapd_tsk = tsk;
+
+	pr_debug("node %d: %ld sgx pages", nid, nr_pages);
+	return 0;
+}
+
+static int address_to_node(unsigned long addr)
+{
+	int n;
+
+	for_each_online_node(n) {
+		if (addr >= PFN_PHYS(node_start_pfn(n)) &&
+			addr < PFN_PHYS(node_end_pfn(n)))
+			return n;
+	}
+
+	return -1;
+}
+
+/**
+ *	Returns the closest SGX node to node n
+ *	with corresponding bit in *mask set
+ */
+static int find_best_sgx_node(int n, nodemask_t *mask)
+{
+	int nn, best = -1;
+	unsigned int dist = -1, d;
+
+	for_each_online_node(nn) {
+		if (n == nn)
+			continue;
+		if (!node_isset(nn, *mask))
+			continue;
+		if (!NODE_HAS_SGX(nn))
+			continue;
+		d = node_distance(n, nn);
+		if (d < dist) {
+			best = nn;
+			dist = d;
+		}
+	}
+
+	return best;
+}
+
+static int sgx_nodes_init(void)
+{
+	int n, i, ret, nn;
+	int nr_sgx_nodes = 0;
+	nodemask_t nmask;
+	struct sgx_epc_node *node;
+
+	for_each_online_node(n) {
+		if (!NODE_HAS_SGX(n))
+			continue;
+
+		ret = sgx_init_epc_node(n);
+		if (ret)
+			return ret;
+
+		nr_sgx_nodes++;
+	}
+
+	for_each_online_node(n) {
+		nodes_setall(nmask);
+		node = SGX_NODE_DATA(n);
+		node->near_list = kcalloc((1+nr_sgx_nodes),
+			sizeof(int), GFP_KERNEL);
+		if (!node->near_list)
+			return -ENOMEM;
+
+		i = 0;
+		while (-1 != (nn = find_best_sgx_node(n, &nmask))) {
+			node->near_list[i] = nn;
+			node_clear(nn, nmask);
+			i++;
+		}
+		node->near_list[i] = -1;
+	}
+
+	return 0;
+}
+
+static unsigned long get_epc_bank_range(int n, u64 *pa)
+{
+	unsigned int eax;
+	unsigned int ebx;
+	unsigned int ecx;
+	unsigned int edx;
+
+	cpuid_count(SGX_CPUID, n + 2, &eax, &ebx,
+			&ecx, &edx);
+	if (!(eax & 0xf))
+		return -1;
+
+	*pa = ((u64)(ebx & 0xfffff) << 32) + (u64)(eax & 0xfffff000);
+	return ((u64)(edx & 0xfffff) << 32) + (u64)(ecx & 0xfffff000);
 }
 
 static inline u64 sgx_combine_bank_regs(u64 low, u64 high)
@@ -454,34 +578,68 @@ static inline u64 sgx_combine_bank_regs(u64 low, u64 high)
 
 static __init int sgx_page_cache_init(void)
 {
-	u32 eax, ebx, ecx, edx;
 	u64 pa, size;
 	int ret;
+	int nid1, nid2;
 	int i;
 
-	BUILD_BUG_ON(SGX_MAX_EPC_BANKS > (SGX_EPC_BANK_MASK + 1));
+	BUILD_BUG_ON(MAX_SGX_NUMNODES > (SGX_EPC_NODE_MASK + 1));
+
+	for_each_online_node(i) {
+		pr_debug("node %d: start=0x%llx end=0x%llx\n", i,
+					PFN_PHYS(node_start_pfn(i)),
+					PFN_PHYS(node_end_pfn(i)));
+	}
 
 	for (i = 0; i < SGX_MAX_EPC_BANKS; i++) {
-		cpuid_count(SGX_CPUID, 2 + i, &eax, &ebx, &ecx, &edx);
-		if (!(eax & 0xF))
+		size = get_epc_bank_range(i, &pa);
+		if (-1 == size)
 			break;
 
-		pa = sgx_combine_bank_regs(eax, ebx);
-		size = sgx_combine_bank_regs(ecx, edx);
 		pr_info("EPC bank 0x%llx-0x%llx\n", pa, pa + size - 1);
+		nid1 = address_to_node(pa);
+		nid2 = address_to_node(pa + size - 1);
 
-		ret = sgx_init_epc_bank(pa, size, i, &sgx_epc_banks[i]);
+		if (nid1 == nid2 || -1 == nid1 || -1 == nid2) {
+			if (-1 == nid1) {
+				if (-1 == nid2)
+					nid1 = 0;
+				else
+					nid1 = nid2;
+			}
+			ret = sgx_init_epc_bank(pa, size,
+				sgx_nr_epc_banks++, nid1);
+		} else {
+			/* We have a bank that crosses boundaries */
+			unsigned long boundary = PFN_PHYS(node_end_pfn(nid1));
+
+			pr_info("\tEPC bank crosses boundary nodes %d and %d\n",
+						nid1, nid2);
+			ret = sgx_init_epc_bank(pa, boundary-pa,
+				sgx_nr_epc_banks++, nid1);
+			if (ret) {
+				sgx_page_cache_teardown();
+				return ret;
+			}
+			ret = sgx_init_epc_bank(boundary, size-boundary+pa,
+					sgx_nr_epc_banks++, nid2);
+		}
+
 		if (ret) {
 			sgx_page_cache_teardown();
 			return ret;
 		}
-
-		sgx_nr_epc_banks++;
 	}
 
 	if (!sgx_nr_epc_banks) {
 		pr_err("There are zero EPC banks.\n");
 		return -ENODEV;
+	}
+
+	ret = sgx_nodes_init();
+	if (ret) {
+		sgx_page_cache_teardown();
+		return ret;
 	}
 
 	return 0;
@@ -498,7 +656,6 @@ static int sgx_pm_notifier_cb(struct notifier_block *nb, unsigned long action,
 
 static __init int sgx_init(void)
 {
-	struct task_struct *tsk;
 	unsigned long fc;
 	int ret;
 
@@ -531,18 +688,9 @@ static __init int sgx_init(void)
 	if (ret)
 		goto out_pm;
 
-	tsk = kthread_run(ksgxswapd, NULL, "ksgxswapd");
-	if (IS_ERR(tsk)) {
-		ret = PTR_ERR(tsk);
-		goto out_pcache;
-	}
-	ksgxswapd_tsk = tsk;
-
 	sgx_enabled = true;
 	sgx_lc_enabled = !!(fc & FEATURE_CONTROL_SGX_LE_WR);
 	return 0;
-out_pcache:
-	sgx_page_cache_teardown();
 out_pm:
 	unregister_pm_notifier(&sgx_pm_notifier);
 	return ret;

@@ -56,14 +56,15 @@ void sgx_flush_cpus(struct sgx_encl *encl)
 }
 
 static struct sgx_epc_page *__sgx_load_faulted_page(
-	struct sgx_encl_page *encl_page)
+	struct sgx_encl_page *encl_page, struct vm_area_struct *vma)
 {
 	unsigned long va_offset = SGX_ENCL_PAGE_VA_OFFSET(encl_page);
 	struct sgx_encl *encl = encl_page->encl;
 	struct sgx_epc_page *epc_page;
 	int ret;
 
-	epc_page = sgx_alloc_page(&encl_page->impl, SGX_ALLOC_ATOMIC);
+	epc_page = sgx_alloc_page_vma(&encl_page->impl, SGX_ALLOC_ATOMIC,
+					SGX_ENCL_PAGE_ADDR(encl_page), vma);
 	if (IS_ERR(epc_page))
 		return epc_page;
 	ret = sgx_encl_load_page(encl_page, epc_page);
@@ -113,11 +114,11 @@ static struct sgx_encl_page *__sgx_fault_page(struct vm_area_struct *vma,
 	}
 
 	if (!(encl->secs.desc & SGX_ENCL_PAGE_LOADED)) {
-		epc_page = __sgx_load_faulted_page(&encl->secs);
+		epc_page = __sgx_load_faulted_page(&encl->secs, vma);
 		if (IS_ERR(epc_page))
 			return (void *)epc_page;
 	}
-	epc_page = __sgx_load_faulted_page(entry);
+	epc_page = __sgx_load_faulted_page(entry, vma);
 	if (IS_ERR(epc_page))
 		return (void *)epc_page;
 

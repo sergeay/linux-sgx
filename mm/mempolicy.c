@@ -290,6 +290,7 @@ void __mpol_put(struct mempolicy *p)
 		return;
 	kmem_cache_free(policy_cache, p);
 }
+EXPORT_SYMBOL(__mpol_put);
 
 static void mpol_rebind_default(struct mempolicy *pol, const nodemask_t *nodes)
 {
@@ -1648,7 +1649,7 @@ struct mempolicy *__get_vma_policy(struct vm_area_struct *vma,
  * freeing by another task.  It is the caller's responsibility to free the
  * extra reference for shared policies.
  */
-static struct mempolicy *get_vma_policy(struct vm_area_struct *vma,
+struct mempolicy *get_vma_policy(struct vm_area_struct *vma,
 						unsigned long addr)
 {
 	struct mempolicy *pol = __get_vma_policy(vma, addr);
@@ -1658,6 +1659,7 @@ static struct mempolicy *get_vma_policy(struct vm_area_struct *vma,
 
 	return pol;
 }
+EXPORT_SYMBOL(get_vma_policy);
 
 bool vma_policy_mof(struct vm_area_struct *vma)
 {
@@ -1790,27 +1792,6 @@ unsigned int mempolicy_slab_node(void)
 	default:
 		BUG();
 	}
-}
-
-/*
- * Do static interleaving for a VMA with known offset @n.  Returns the n'th
- * node in pol->v.nodes (starting from n=0), wrapping around if n exceeds the
- * number of present nodes.
- */
-static unsigned offset_il_node(struct mempolicy *pol, unsigned long n)
-{
-	unsigned nnodes = nodes_weight(pol->v.nodes);
-	unsigned target;
-	int i;
-	int nid;
-
-	if (!nnodes)
-		return numa_node_id();
-	target = (unsigned int)n % nnodes;
-	nid = first_node(pol->v.nodes);
-	for (i = 0; i < target; i++)
-		nid = next_node(nid, pol->v.nodes);
-	return nid;
 }
 
 /* Determine a node number for interleave */

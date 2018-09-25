@@ -58,6 +58,28 @@ struct mempolicy {
 };
 
 /*
+ * Do static interleaving for a VMA with known offset @n.  Returns the n'th
+ * node in pol->v.nodes (starting from n=0), wrapping around if n exceeds the
+ * number of present nodes.
+ */
+static inline unsigned int offset_il_node(struct mempolicy *pol,
+				unsigned long n)
+{
+	unsigned int nnodes = nodes_weight(pol->v.nodes);
+	unsigned int target;
+	int i;
+	int nid;
+
+	if (!nnodes)
+		return numa_node_id();
+	target = (unsigned int)n % nnodes;
+	nid = first_node(pol->v.nodes);
+	for (i = 0; i < target; i++)
+		nid = next_node(nid, pol->v.nodes);
+	return nid;
+}
+
+/*
  * Support for managing mempolicy data objects (clone, copy, destroy)
  * The default fast path of a NULL MPOL_DEFAULT policy is always inlined.
  */
@@ -139,6 +161,8 @@ struct mempolicy *mpol_shared_policy_lookup(struct shared_policy *sp,
 struct mempolicy *get_task_policy(struct task_struct *p);
 struct mempolicy *__get_vma_policy(struct vm_area_struct *vma,
 		unsigned long addr);
+struct mempolicy *get_vma_policy(struct vm_area_struct *vma,
+						unsigned long addr);
 bool vma_policy_mof(struct vm_area_struct *vma);
 
 extern void numa_default_policy(void);
