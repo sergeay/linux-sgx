@@ -20,6 +20,9 @@
 #include <linux/swap.h>
 #include <linux/slab.h>
 
+unsigned long get_total_sgx_mem(int nid);
+unsigned long get_free_sgx_mem(int nid);
+
 static struct bus_type node_subsys = {
 	.name = "node",
 	.dev_name = "node",
@@ -73,6 +76,8 @@ static ssize_t node_read_meminfo(struct device *dev,
 		       "Node %d MemTotal:       %8lu kB\n"
 		       "Node %d MemFree:        %8lu kB\n"
 		       "Node %d MemUsed:        %8lu kB\n"
+		       "Node %d MemSgxTotal:    %8lu kB\n"
+		       "Node %d MemSgxFree:     %8lu kB\n"
 		       "Node %d Active:         %8lu kB\n"
 		       "Node %d Inactive:       %8lu kB\n"
 		       "Node %d Active(anon):   %8lu kB\n"
@@ -84,6 +89,8 @@ static ssize_t node_read_meminfo(struct device *dev,
 		       nid, K(i.totalram),
 		       nid, K(i.freeram),
 		       nid, K(i.totalram - i.freeram),
+		       nid, get_total_sgx_mem(nid),
+		       nid, get_free_sgx_mem(nid),
 		       nid, K(node_page_state(pgdat, NR_ACTIVE_ANON) +
 				node_page_state(pgdat, NR_ACTIVE_FILE)),
 		       nid, K(node_page_state(pgdat, NR_INACTIVE_ANON) +

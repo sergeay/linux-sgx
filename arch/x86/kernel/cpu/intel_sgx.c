@@ -464,6 +464,7 @@ static __init int sgx_init_epc_node(int nid)
 		node->pages[i]->desc = addr | nid;
 	}
 
+	node->nr_total_pages = nr_pages;
 	spin_lock_init(&node->lock);
 	init_waitqueue_head(&node->kswapd_waitq);
 	kthname[9] += nid;
@@ -477,6 +478,22 @@ static __init int sgx_init_epc_node(int nid)
 	pr_debug("node %d: %ld sgx pages", nid, nr_pages);
 	return 0;
 }
+
+unsigned long get_total_sgx_mem(int i)
+{
+	struct sgx_epc_node *node = SGX_NODE_DATA(i);
+
+	return node->nr_total_pages << PAGE_SHIFT;
+}
+EXPORT_SYMBOL(get_total_sgx_mem);
+
+unsigned long get_free_sgx_mem(int i)
+{
+	struct sgx_epc_node *node = SGX_NODE_DATA(i);
+
+	return node->free_cnt << PAGE_SHIFT;
+}
+EXPORT_SYMBOL(get_free_sgx_mem);
 
 static int address_to_node(unsigned long addr)
 {
@@ -586,9 +603,9 @@ static __init int sgx_page_cache_init(void)
 	BUILD_BUG_ON(MAX_SGX_NUMNODES > (SGX_EPC_NODE_MASK + 1));
 
 	for_each_online_node(i) {
-		pr_debug("node %d: start=0x%llx end=0x%llx\n", i,
-					PFN_PHYS(node_start_pfn(i)),
-					PFN_PHYS(node_end_pfn(i)));
+		pr_info("node %d: start=0x%llx end=0x%llx\n", i,
+				PFN_PHYS(node_start_pfn(i)),
+				PFN_PHYS(node_end_pfn(i)));
 	}
 
 	for (i = 0; i < SGX_MAX_EPC_BANKS; i++) {
@@ -613,15 +630,15 @@ static __init int sgx_page_cache_init(void)
 			/* We have a bank that crosses boundaries */
 			unsigned long boundary = PFN_PHYS(node_end_pfn(nid1));
 
-			pr_info("\tEPC bank crosses boundary nodes %d and %d\n",
-						nid1, nid2);
+			pr_info("\tEPC bank crosses boundary nodes %d and %d at address 0x%lx\n",
+						nid1, nid2, boundary);
 			ret = sgx_init_epc_bank(pa, boundary-pa,
 				sgx_nr_epc_banks++, nid1);
 			if (ret) {
 				sgx_page_cache_teardown();
 				return ret;
 			}
-			ret = sgx_init_epc_bank(boundary, size-boundary+pa,
+			ret = sgx_init_epc_bank(boundary, size+pa-boundary,
 					sgx_nr_epc_banks++, nid2);
 		}
 
@@ -659,11 +676,15 @@ static __init int sgx_init(void)
 	unsigned long fc;
 	int ret;
 
-	if (!boot_cpu_has(X86_FEATURE_SGX))
+	if (!boot_cpu_has(X86_FEATURE_SGX)) {
+		pr_info("X86_FEATURE_SGX feature is not available on cpu\n");
 		return false;
+	}
 
-	if (!boot_cpu_has(X86_FEATURE_SGX1))
+	if (!boot_cpu_has(X86_FEATURE_SGX1)) {
+		pr_info("X86_FEATURE_SGX1 feature is not available on cpu\n");
 		return false;
+	}
 
 	rdmsrl(MSR_IA32_FEATURE_CONTROL, fc);
 	if (!(fc & FEATURE_CONTROL_LOCKED)) {
