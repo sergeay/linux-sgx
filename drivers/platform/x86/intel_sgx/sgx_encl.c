@@ -232,8 +232,11 @@ static void sgx_add_page_worker(struct work_struct *work)
 		is_empty = list_empty(&encl->add_page_reqs);
 		mutex_unlock(&encl->lock);
 
-		if (skip_rest)
+		if (skip_rest) {
+			sgx_free_page(req->encl_page->epc_page);
+			req->encl_page->epc_page = NULL;
 			goto next;
+		}
 
 		down_read(&encl->mm->mmap_sem);
 		mutex_lock(&encl->lock);
