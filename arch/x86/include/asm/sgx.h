@@ -58,6 +58,7 @@ struct sgx_epc_node {
 	struct sgx_epc_page *pages_data;
 	struct sgx_epc_page **pages;
 	unsigned long free_cnt;
+	unsigned long nr_total_pages;
 	spinlock_t lock;
 	struct list_head active_page_list;
 	spinlock_t active_page_list_lock;
