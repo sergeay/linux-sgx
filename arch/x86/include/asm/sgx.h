@@ -404,7 +404,7 @@ static inline void move_to_active_list_end(struct sgx_epc_page *epc_page,
 
 static inline void remove_from_active_list(struct sgx_epc_page *epc_page)
 {
-	list_del(&epc_page->list);
+	list_del_init(&epc_page->list);
 }
 
 static inline void return_to_active_list_tail(struct sgx_epc_page *epc_page,
